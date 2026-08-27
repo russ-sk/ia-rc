@@ -121,3 +121,104 @@ for _, r in a_sum.head(3).iterrows():
     print(f"  {str(r.SUM_TITLE)[:120]}")
     print(f"  {str(r.SUM_TEXT)[:400]}")
 
+# %% A5. What is E2's actual grain?
+n_sum = e2p.SUM_ID.nunique()
+print(f"rows {len(e2p):,}  summaries {n_sum:,}  rows/summary {len(e2p)/n_sum:.2f}\n")
+
+print("summaries where this column takes more than one value:")
+g = e2p.groupby("SUM_ID")
+for c in ["REG_ID", "JUR", "REG_STATUS", "REG_VER", "SUM_STATUS", "SUM_VER",
+          "SUM_TITLE", "SUM_TEXT", "SUM_STEWARD",
+          "SUM_TAX_L1", "SUM_TAX_L2", "SUM_TAX_L3", "LIB_RISK_ID"]:
+    n = int((g[c].nunique(dropna=False) > 1).sum())
+    print(f"   {c:<12} {n:>6,} / {n_sum:,}")
+
+# split into the grains that actually exist
+SUM_CORE = ["JUR", "REG_ID", "REG_STATUS", "REG_VER",
+            "SUM_ID", "SUM_STATUS", "SUM_VER",
+            "SUM_TITLE", "SUM_TEXT", "SUM_STEWARD"]
+
+summaries = e2p[SUM_CORE].drop_duplicates()
+sum_risks = e2p[["REG_ID", "SUM_ID", "LIB_RISK_ID"]].dropna().drop_duplicates()
+sum_tax   = e2p[["REG_ID", "SUM_ID", "SUM_TAX_L1", "SUM_TAX_L2", "SUM_TAX_L3"]].drop_duplicates()
+
+print(f"\nsummaries  : {len(summaries):,} rows, {summaries.SUM_ID.nunique():,} ids")
+print(f"sum_risks  : {len(sum_risks):,} rows, "
+      f"{sum_risks.groupby('SUM_ID').LIB_RISK_ID.nunique().mean():.2f} library risks per summary")
+print(f"sum_tax    : {len(sum_tax):,} rows")
+
+if len(summaries) != summaries.SUM_ID.nunique():
+    dupes = summaries[summaries.duplicated("SUM_ID", keep=False)].sort_values("SUM_ID")
+    print(f"\n[!] SUM_ID still not unique after dedupe — {dupes.SUM_ID.nunique()} ids affected")
+    print(dupes.head(6).to_string())
+
+a_sum = (linked[["RECORD_ID", "REG_ID", "link_score"]]
+         .merge(summaries[summaries.REG_ID.isin(WORK_REGS)], on="REG_ID", how="inner"))
+print(f"\nalert x summary rows: {len(a_sum):,}")
+print(a_sum.groupby("RECORD_ID").SUM_ID.nunique().to_string())
+
+
+# %% A6. Extract 3 — library controls
+raw3 = read_extract(3)
+print(raw3.columns.tolist())
+
+C.update({
+    "APPLIC_KEY":  "Regulation Summary Applicability Unique Key",
+    "L1_LIB_CTRL": "Regulation Summary L1 Library Control ID Number",
+})
+
+APPLICABILITY_KEY = SUMMARY_KEY + ["SUM_TAX_L1", "SUM_TAX_L2", "SUM_TAX_L3", "APPLIC_KEY"]
+
+E3_COLS = APPLICABILITY_KEY + ["LIB_RISK_ID", "L1_LIB_CTRL"]
+e3 = standardise(raw3, E3_COLS)
+for c in ["REG_ID", "SUM_ID", "APPLIC_KEY", "LIB_RISK_ID", "L1_LIB_CTRL"]:
+    e3[c] = e3[c].astype(str).str.strip().replace({"nan": np.nan, "None": np.nan, "": np.nan})
+
+print("\nREG_STATUS:", e3.REG_STATUS.value_counts(dropna=False).to_dict())
+print("SUM_STATUS:", e3.SUM_STATUS.value_counts(dropna=False).to_dict())
+
+e3p = e3[(e3.REG_STATUS.str.strip().str.casefold() == "published") &
+         (e3.SUM_STATUS.str.strip().str.casefold() == "published") &
+          e3.L1_LIB_CTRL.notna()]
+print(f"published + has L1 library control: {len(e3):,} -> {len(e3p):,}")
+print(f"distinct L1 library controls in RegMap: {e3p.L1_LIB_CTRL.nunique():,}")
+
+
+# %% A6b. Join on the full blue key
+def norm_keys(df, cols):
+    out = df.copy()
+    for c in cols:
+        out[c] = out[c].astype(str).str.strip()
+        out.loc[out[c].isin(["nan", "None", "NaT", ""]), c] = np.nan
+    return out
+
+def keyed_merge(left, right, keys, label):
+    missing = [k for k in keys if k not in left.columns or k not in right.columns]
+    if missing:
+        raise KeyError(f"{label}: missing join cols {missing}")
+    l, r = norm_keys(left, keys), norm_keys(right, keys)
+    merged = l.merge(r, on=keys, how="inner")
+    rk = [k for k in ["REG_ID", "SUM_ID"] if k in l.columns]
+    hit_full = len(l.merge(r[keys].drop_duplicates(), on=keys, how="inner"))
+    hit_red  = len(l.merge(r[rk].drop_duplicates(), on=rk, how="inner"))
+    print(f"\n[{label}] keys={len(keys)}  left={len(l):,} right={len(r):,} merged={len(merged):,}")
+    print(f"    left rows matching on FULL key : {hit_full:,}")
+    print(f"    left rows matching on {rk} : {hit_red:,}")
+    if hit_red > hit_full:
+        print(f"    [!] {hit_red - hit_full:,} rows match on IDs but not the full key "
+              "— status/version strings differ between extracts")
+    return merged
+
+# a_sum carries no taxonomy, so E3->E2 uses SUMMARY_KEY only
+library = keyed_merge(a_sum, e3p, SUMMARY_KEY, "E3->E2")
+library["source"] = "regmap"
+
+print(f"\nlibrary controls per alert:")
+print(library.groupby("RECORD_ID").L1_LIB_CTRL.nunique().to_string())
+print(f"\ndistinct library controls surfaced: {library.L1_LIB_CTRL.nunique():,}")
+print(library[["RECORD_ID","REG_ID","SUM_ID","APPLIC_KEY","LIB_RISK_ID","L1_LIB_CTRL"]]
+      .drop_duplicates().head(15).to_string(index=False))
+
+
+
+
