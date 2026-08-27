@@ -219,6 +219,71 @@ print(f"\ndistinct library controls surfaced: {library.L1_LIB_CTRL.nunique():,}"
 print(library[["RECORD_ID","REG_ID","SUM_ID","APPLIC_KEY","LIB_RISK_ID","L1_LIB_CTRL"]]
       .drop_duplicates().head(15).to_string(index=False))
 
+# %% A7. Lane A — alert -> regulation -> summary -> library risk
+def joinset(s):
+    return " | ".join(sorted({str(x) for x in s if pd.notna(x)}))
+
+# a_sum is 14 clean rows; sum_risks is (REG_ID, SUM_ID, LIB_RISK_ID) distinct
+laneA_risk = a_sum.merge(sum_risks, on=["REG_ID", "SUM_ID"], how="inner")
+print(f"alert x summary x library-risk rows: {len(laneA_risk):,}")
+
+risk_rec = (laneA_risk
+    .groupby(["RECORD_ID", "LIB_RISK_ID"])
+    .agg(n_summaries     = ("SUM_ID", "nunique"),
+         n_regulations   = ("REG_ID", "nunique"),
+         max_link_score  = ("link_score", "max"),
+         via_regulations = ("REG_ID", joinset),
+         via_summaries   = ("SUM_ID", joinset),
+         steward_areas   = ("SUM_STEWARD", joinset))
+    .reset_index())
+
+# support = how many linked summaries point at this risk; the free ranking signal
+risk_rec = risk_rec.sort_values(
+    ["RECORD_ID", "n_summaries", "max_link_score"], ascending=[True, False, False])
+risk_rec["rank"] = risk_rec.groupby("RECORD_ID").cumcount() + 1
+risk_rec["source"] = "regmap"
+
+print("\nlibrary risks per alert:")
+print(risk_rec.groupby("RECORD_ID").LIB_RISK_ID.nunique().to_string())
+
+total_risks = sum_risks.LIB_RISK_ID.nunique()
+print(f"\ndistinct library risks in RegMap overall: {total_risks:,}")
+for rid, n in risk_rec.groupby("RECORD_ID").LIB_RISK_ID.nunique().items():
+    print(f"   {rid}: {n} risks = {n/total_risks:.1%} of the estate")
+
+print("\nhow much support does each recommendation have?")
+print(risk_rec.n_summaries.value_counts().sort_index().to_string())
+print("(support 1 = a single summary points at it; higher = several linked "
+      "summaries agree, which is the only ranking signal Lane A has for free)")
+
+print("\ntop 10 per alert:")
+for rid, grp in risk_rec.groupby("RECORD_ID"):
+    print(f"\n--- {rid} ---")
+    print(grp.head(10)[["rank", "LIB_RISK_ID", "n_summaries", "n_regulations",
+                        "max_link_score", "via_regulations", "steward_areas"]]
+          .to_string(index=False))
+
+
+# %% A7b. What would each recommended risk bring in controls?
+ctrl_per_risk = (e3p[["LIB_RISK_ID", "L1_LIB_CTRL"]].dropna().drop_duplicates()
+                 .groupby("LIB_RISK_ID").L1_LIB_CTRL.nunique().rename("n_controls"))
+
+risk_rec = risk_rec.merge(ctrl_per_risk, on="LIB_RISK_ID", how="left")
+risk_rec["n_controls"] = risk_rec.n_controls.fillna(0).astype(int)
+
+print("controls per recommended risk:")
+print(risk_rec.n_controls.describe().to_string())
+
+print("\ncumulative control count as you accept risks in rank order:")
+for rid, grp in risk_rec.groupby("RECORD_ID"):
+    g = grp.sort_values("rank")
+    seen, cum = set(), []
+    for _, r in g.iterrows():
+        seen |= set(e3p.loc[e3p.LIB_RISK_ID == r.LIB_RISK_ID, "L1_LIB_CTRL"].dropna())
+        cum.append(len(seen))
+    print(f"   {rid}: {cum[:12]}{' ...' if len(cum) > 12 else ''}  (all = {cum[-1]})")
+
+risk_rec.to_parquet(OUT / "laneA_risk_recommendations.parquet", index=False)
 
 
 
