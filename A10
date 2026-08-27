@@ -195,4 +195,258 @@ spread = [max(cos[(r,c)] for c in per_alert[r]) - min(cos[(r,c)] for c in per_al
           for r in per_alert if len(per_alert[r]) > 1]
 print(f"cosine spread within shortlist: median={np.median(spread):.3f}")
 
+# %% A10e. Judge the Standard-branch candidate risks
+RISK_SYSTEM_PROMPT = """ROLE:
+You are a Lead Operational Risk Analyst at a Tier-1 Global Bank, expert in mapping
+external regulatory developments onto an internal risk taxonomy.
+
+CONTEXT:
+An incoming regulatory alert has already been linked to one or more regulations. Those
+regulations carry summaries whose control mapping was done at a STANDARD level of rigour —
+a lighter-touch mapping than the Detailed and Enhanced summaries elsewhere in the estate.
+The risks attached to them are therefore less reliable: some are right, some were attached
+without close analysis. Confirm the ones the alert genuinely bears on.
+
+Rules of Execution:
+1. Populate "reasoning" BEFORE deciding. Reason first, then commit.
+2. Evaluate EACH candidate library risk independently against the alert.
+3. Assign a "decision", exactly one of:
+   - "LINKED": the alert changes, constrains, or creates obligations for how this risk
+     must be managed or controlled.
+   - "NOT_LINKED": the risk concerns a materially different subject.
+   - "INSUFFICIENT_EVIDENCE": the risk description is too generic or sparse to decide.
+4. Judge on subject-matter overlap, not vocabulary overlap. A risk written in internal
+   control language may still be the right risk for an alert written in legal language.
+   Shared generic words ("reporting", "compliance", "customer") are not a link.
+5. Judge each candidate on its own merits. The candidate list is short and was not
+   exhaustively curated, so do not assume a fixed proportion should be accepted or rejected.
+6. "evidence_from_alert" must be an exact verbatim substring of the alert text, or null
+   if no single span justifies the decision. Never paraphrase into this field.
+7. "link_score" is an integer 0-10 for how directly the alert bears on the risk.
+8. Return exactly one verdict per supplied library_risk_id. Never invent an ID.
+"""
+
+RISK_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {"name": "risk_verdicts", "strict": True, "schema": {
+        "type": "object", "additionalProperties": False, "required": ["items"],
+        "properties": {"items": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["library_risk_id", "reasoning", "decision",
+                         "link_score", "evidence_from_alert"],
+            "properties": {
+                "library_risk_id":     {"type": "string"},
+                "reasoning":           {"type": "string"},
+                "decision":            {"type": "string",
+                                        "enum": ["LINKED", "NOT_LINKED",
+                                                 "INSUFFICIENT_EVIDENCE"]},
+                "link_score":          {"type": "integer"},
+                "evidence_from_alert": {"type": ["string", "null"]},
+            }}}}}}}
+
+
+async def judge_risks(alert_text, cands):
+    payload = {"alert_text": alert_text,
+               "library_risks": [{"library_risk_id": i, "risk_text": t} for i, t in cands]}
+    messages = [{"role": "system", "content": RISK_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+    last = None
+    for att in range(LANE_A_HP["max_retries"]):
+        try:
+            t = await tok.get()
+            r = await oai.chat.completions.create(
+                model=MODEL, messages=messages, user=USE_CASE, temperature=0.0,
+                max_tokens=LANE_A_HP["max_tokens"],
+                seed=42 + att,                     # vary: an identical retry re-truncates
+                response_format=RISK_SCHEMA,
+                extra_headers={"X-HSBC-E2E-Trust-Token": t})
+            u = r.usage
+            USAGE.append({"kind": "chat", "in": u.prompt_tokens,
+                          "out": u.completion_tokens, "ts": time.time()})
+            return json.loads(r.choices[0].message.content)["items"]
+        except Exception as e:
+            last = e
+            await asyncio.sleep(1.5 ** (att + 1))
+    print(f"[judge] failed after {LANE_A_HP['max_retries']}: {last}")
+    return [{"library_risk_id": i, "decision": "ERROR", "link_score": 0,
+             "reasoning": f"n/a: {last}", "evidence_from_alert": None} for i, _ in cands]
+
+
+def _nrm(s):
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+
+async def run_judge():
+    sem = asyncio.Semaphore(LANE_A_HP["concurrency"])
+
+    async def one(rid):
+        async with sem:
+            cs = [(c, rtext[c]) for c in per_alert[rid]]
+            items = await judge_risks(atext[rid], cs)
+            rank = {c: i + 1 for i, c in enumerate(per_alert[rid])}
+            out = []
+            for it in items:
+                ev = it.get("evidence_from_alert")
+                out.append({"RECORD_ID": rid,
+                            "LIB_RISK_ID": it["library_risk_id"],
+                            "decision": it["decision"],
+                            "risk_score": it.get("link_score", 0),
+                            "reasoning": it.get("reasoning"),
+                            "evidence_from_alert": ev,
+                            "evidence_grounded": bool(ev) and len(_nrm(ev)) >= 8
+                                                 and _nrm(ev) in _nrm(atext[rid]),
+                            "cosine": cos.get((rid, it["library_risk_id"])),
+                            "cosine_rank": rank.get(it["library_risk_id"])})
+            return out
+
+    rows = []
+    for f in asyncio.as_completed([asyncio.create_task(one(r)) for r in per_alert]):
+        rows += await f
+    return pd.DataFrame(rows)
+
+
+JUDGED_COLS = ["RECORD_ID", "REG_ID", "SUM_ID", "SUM_APPROACH", "LIB_RISK_ID",
+               "L1_LIB_CTRL", "link_score", "branch", "decision", "risk_score", "reasoning"]
+
+if per_alert:
+    verdicts = asyncio.get_event_loop().run_until_complete(run_judge())
+    print(f"verdicts: {verdicts.decision.value_counts().to_dict()}")
+
+    lk = verdicts[verdicts.decision == "LINKED"]
+    if len(lk):
+        print(f"evidence grounded on LINKED : {lk.evidence_grounded.mean():.1%}")
+        print(f"link_score on LINKED        : median={lk.risk_score.median():.0f} "
+              f"min={lk.risk_score.min()} max={lk.risk_score.max()}")
+        print(f"cosine rank of LINKED       : {lk.cosine_rank.tolist()}")
+
+    accepted = verdicts[(verdicts.decision == "LINKED") &
+                        (verdicts.risk_score >= LANE_A_HP["min_score"])]
+    print(f"accepted: {len(accepted):,} of {len(verdicts):,} verdicts "
+          f"(score >= {LANE_A_HP['min_score']})")
+
+    judged = (cand.merge(accepted[["RECORD_ID", "LIB_RISK_ID", "decision",
+                                   "risk_score", "reasoning"]],
+                         on=["RECORD_ID", "LIB_RISK_ID"], how="inner")
+                  .merge(rc[["REG_ID", "SUM_ID", "LIB_RISK_ID", "L1_LIB_CTRL"]]
+                         .drop_duplicates(),
+                         on=["REG_ID", "SUM_ID", "LIB_RISK_ID"], how="inner"))
+    judged["branch"] = "judged"
+else:
+    verdicts = pd.DataFrame()
+    judged   = pd.DataFrame(columns=JUDGED_COLS)
+    print("no Standard-branch candidates — embedding and LLM skipped entirely")
+
+# risks RegMap references but Helios has no text for: carry, never silently drop
+if per_alert and missing:
+    unres = (cand[cand.LIB_RISK_ID.isin(set(missing))]
+             .merge(rc[["REG_ID", "SUM_ID", "LIB_RISK_ID", "L1_LIB_CTRL"]].drop_duplicates(),
+                    on=["REG_ID", "SUM_ID", "LIB_RISK_ID"], how="inner"))
+    unres["decision"]   = "UNRESOLVED"
+    unres["risk_score"] = 0
+    unres["branch"]     = "judged"
+    unres["reasoning"]  = ("Library risk is referenced by RegMap but absent from Helios, "
+                           "so it has no text and could not be judged. Carried for review.")
+    judged = pd.concat([judged, unres], ignore_index=True)
+    print(f"[unresolved] carried {unres.LIB_RISK_ID.nunique()} unjudgeable risks "
+          f"-> {unres.L1_LIB_CTRL.nunique()} controls")
+
+print(f"\njudged branch rows={len(judged):,}  "
+      f"risks={judged.LIB_RISK_ID.nunique() if len(judged) else 0}  "
+      f"controls={judged.L1_LIB_CTRL.nunique() if len(judged) else 0}")
+
+# %% A10f. Assemble
+l1_raw = read_helios("L1_Control")
+
+hcontrols = (l1_raw[["l1_library_control_id", "l1_library_control_title",
+                     "l1_library_control_desc"]]
+             .dropna(subset=["l1_library_control_id"])
+             .drop_duplicates(subset=["l1_library_control_id"])
+             .rename(columns={"l1_library_control_id":    "L1_LIB_CTRL",
+                              "l1_library_control_title": "control_title",
+                              "l1_library_control_desc":  "control_description"}))
+hcontrols["L1_LIB_CTRL"] = hcontrols.L1_LIB_CTRL.astype(str).str.strip()
+
+hinst = (l1_raw[["l1_library_control_id", "name"]].dropna().drop_duplicates()
+         .rename(columns={"l1_library_control_id": "L1_LIB_CTRL", "name": "l1_control_id"}))
+hinst["L1_LIB_CTRL"] = hinst.L1_LIB_CTRL.astype(str).str.strip()
+instances = (hinst.groupby("L1_LIB_CTRL").l1_control_id
+             .apply(lambda s: " | ".join(sorted(set(s))))
+             .rename("l1_control_instances").reset_index())
+
+both = pd.concat([d.reindex(columns=JUDGED_COLS) for d in (direct, judged) if len(d)],
+                 ignore_index=True)
+
+final = (both.groupby(["RECORD_ID", "L1_LIB_CTRL"])
+    .agg(branches        = ("branch", joinset),
+         decisions       = ("decision", joinset),
+         best_risk_score = ("risk_score", "max"),
+         max_link_score  = ("link_score", "max"),
+         n_risks         = ("LIB_RISK_ID", "nunique"),
+         n_summaries     = ("SUM_ID", "nunique"),
+         via_risks       = ("LIB_RISK_ID", joinset),
+         via_summaries   = ("SUM_ID", joinset),
+         via_regulations = ("REG_ID", joinset),
+         via_approaches  = ("SUM_APPROACH", joinset))
+    .reset_index())
+
+final["branch"] = np.where(final.branches.str.contains("direct"),
+                    np.where(final.branches.str.contains("judged"), "both", "direct"),
+                    "judged")
+
+final["confidence"] = np.select(
+    [final.decisions.eq("UNRESOLVED"),          # reached ONLY by an unjudgeable risk
+     final.branch.isin(["direct", "both"]),
+     final.best_risk_score >= 8,
+     final.best_risk_score >= 5],
+    ["REVIEW", "HIGH", "HIGH", "MEDIUM"], default="LOW")
+
+final = (final.merge(hcontrols, on="L1_LIB_CTRL", how="left")
+              .merge(instances, on="L1_LIB_CTRL", how="left"))
+final["source"] = "regmap_laneA"
+
+final = final.sort_values(["RECORD_ID", "branch", "best_risk_score", "n_risks"],
+                          ascending=[True, True, False, False])
+final["rank"] = final.groupby("RECORD_ID").cumcount() + 1
+
+print(f"final rows={len(final):,}  alerts={final.RECORD_ID.nunique():,}")
+print(f"\nby branch:\n{final.branch.value_counts().to_string()}")
+print(f"\nby confidence:\n{final.confidence.value_counts().to_string()}")
+print(f"\ncontrols missing Helios text: {final.control_title.isna().sum():,}")
+
+
+# %% A10g. Lane A diagnostics
+print("=" * 66); print("LANE A"); print("=" * 66)
+
+per   = final.groupby("RECORD_ID").L1_LIB_CTRL.nunique()
+total = rc.L1_LIB_CTRL.nunique()
+print(f"controls per alert : median={per.median():.0f} "
+      f"p90={per.quantile(.9):.0f} max={per.max()}")
+print(f"median alert claims {per.median()/total:.1%} of the {total:,} control estate")
+
+print("\ncontrols per alert, by branch:")
+print(final.groupby(["RECORD_ID", "branch"]).L1_LIB_CTRL.nunique().to_string())
+
+j = a_sum[a_sum.branch == "judged"]
+if len(j):
+    before = (j[["REG_ID", "SUM_ID"]].drop_duplicates()
+              .merge(rc, on=["REG_ID", "SUM_ID"]).L1_LIB_CTRL.nunique())
+    after  = final.loc[final.branch.isin(["judged", "both"]), "L1_LIB_CTRL"].nunique()
+    print(f"\njudged branch: {before:,} controls before -> {after:,} after "
+          f"({1 - after/max(before,1):.0%} removed)")
+
+for rid, grp in final.groupby("RECORD_ID"):
+    print(f"\n{'='*72}\n{rid}   {len(grp)} controls   "
+          f"{grp.branch.value_counts().to_dict()}\n{'='*72}")
+    for _, r in grp.head(6).iterrows():
+        print(f"\n[{r.branch}/{r.confidence}] {r.L1_LIB_CTRL}  {str(r.control_title)[:75]}")
+        print(f"   risks : {str(r.via_risks)[:90]}")
+        print(f"   via   : {r.via_regulations}   ({r.via_approaches})")
+        print(f"   {str(r.control_description)[:200]}")
+
+final.to_parquet(OUT / "laneA_control_recommendations.parquet", index=False)
+a_sum.to_parquet(OUT / "laneA_routing.parquet", index=False)
+if len(verdicts):
+    verdicts.to_parquet(OUT / "laneA_risk_verdicts.parquet", index=False)
+print(f"\nsaved -> {OUT/'laneA_control_recommendations.parquet'}")
+
 
