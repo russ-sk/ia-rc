@@ -1,0 +1,198 @@
+# %% A10a. Control Mapping Approach
+C["SUM_APPROACH"] = "Regulation Summary Control Mapping Approach"
+
+def norm_approach(s):
+    return (s.astype(str).str.strip().str.title()
+             .replace({"Nan": np.nan, "None": np.nan, "": np.nan, "-": np.nan}))
+
+# E2 with the approach column
+E2_COLS = SUMMARY_KEY + ["SUM_APPROACH", "SUM_TITLE", "SUM_TEXT", "SUM_STEWARD",
+                         "SUM_TAX_L1", "SUM_TAX_L2", "SUM_TAX_L3", "LIB_RISK_ID"]
+e2 = standardise(raw2, E2_COLS)
+for c in ["REG_ID", "SUM_ID", "LIB_RISK_ID"]:
+    e2[c] = e2[c].astype(str).str.strip().replace(
+        {"nan": np.nan, "None": np.nan, "": np.nan, "-": np.nan})
+e2["SUM_APPROACH"] = norm_approach(e2.SUM_APPROACH)
+e2p = e2[(e2.REG_STATUS.str.strip().str.casefold() == "published") &
+         (e2.SUM_STATUS.str.strip().str.casefold() == "published")]
+
+# E3 with the approach column
+E3_COLS = APPLICABILITY_KEY + ["SUM_APPROACH", "LIB_RISK_ID", "L1_LIB_CTRL"]
+e3 = standardise(raw3, E3_COLS)
+for c in ["REG_ID", "SUM_ID", "APPLIC_KEY", "LIB_RISK_ID", "L1_LIB_CTRL"]:
+    e3[c] = e3[c].astype(str).str.strip().replace(
+        {"nan": np.nan, "None": np.nan, "": np.nan, "-": np.nan})
+e3["SUM_APPROACH"] = norm_approach(e3.SUM_APPROACH)
+e3p = e3[(e3.REG_STATUS.str.strip().str.casefold() == "published") &
+         (e3.SUM_STATUS.str.strip().str.casefold() == "published") &
+          e3.LIB_RISK_ID.astype(str).str.startswith("LR-") &
+          e3.L1_LIB_CTRL.astype(str).str.startswith("L1C-")]
+
+print("approach by E2 row:")
+print(e2p.SUM_APPROACH.value_counts(dropna=False).to_string())
+print("\napproach by distinct summary (E2):")
+print(e2p.drop_duplicates("SUM_ID").SUM_APPROACH.value_counts(dropna=False).to_string())
+print(f"\nsummaries with >1 approach value in E2: "
+      f"{(e2p.groupby('SUM_ID').SUM_APPROACH.nunique(dropna=False) > 1).sum()}")
+
+chk = (e2p[["SUM_ID", "SUM_APPROACH"]].drop_duplicates("SUM_ID")
+       .merge(e3p[["SUM_ID", "SUM_APPROACH"]].drop_duplicates("SUM_ID"),
+              on="SUM_ID", suffixes=("_e2", "_e3")))
+print(f"\nE2 vs E3 approach agrees on {(chk.SUM_APPROACH_e2 == chk.SUM_APPROACH_e3).mean():.1%} "
+      f"of {len(chk):,} shared summaries")
+
+print("\ncontrols per summary, by approach (E3):")
+print(e3p.groupby(["SUM_APPROACH", "SUM_ID"]).L1_LIB_CTRL.nunique()
+      .groupby("SUM_APPROACH").describe()[["count", "50%", "90%", "max"]].to_string())
+print("\nrisks per summary, by approach (E3):")
+print(e3p.groupby(["SUM_APPROACH", "SUM_ID"]).LIB_RISK_ID.nunique()
+      .groupby("SUM_APPROACH").describe()[["count", "50%", "90%", "max"]].to_string())
+
+
+# %% A10b. Routing
+DIRECT_APPROACHES = {"Detailed", "Enhanced"}
+UNKNOWN_APPROACH  = "judged"        # blank / unrecognised -> judge, never inherit
+RECORD_FILTER     = None            # None = all alerts in `pairs`
+
+def route(a):
+    a = str(a).strip().title()
+    if a in DIRECT_APPROACHES:  return "direct"
+    if a == "Standard":         return "judged"
+    return UNKNOWN_APPROACH
+
+# summary core attributes, one row per SUM_ID, approach taken from E3
+summaries = e2p[SUMMARY_KEY + ["SUM_TITLE", "SUM_TEXT", "SUM_STEWARD"]].drop_duplicates()
+assert summaries.SUM_ID.is_unique, "SUM_ID not unique — inspect before routing"
+
+appr_e3 = e3p[["SUM_ID", "SUM_APPROACH"]].drop_duplicates("SUM_ID")
+appr_e2 = e2p[["SUM_ID", "SUM_APPROACH"]].drop_duplicates("SUM_ID")
+summaries = (summaries.merge(appr_e3, on="SUM_ID", how="left")
+                      .merge(appr_e2, on="SUM_ID", how="left", suffixes=("", "_e2")))
+summaries["SUM_APPROACH"] = summaries.SUM_APPROACH.fillna(summaries.SUM_APPROACH_e2)
+summaries = summaries.drop(columns=["SUM_APPROACH_e2"])
+
+# all LINKED alert-regulation pairs, not just the working three
+linked_all = pairs.loc[pairs.decision == "LINKED",
+                       ["RECORD_ID", "REG_ID", "link_score"]].copy()
+linked_all["RECORD_ID"] = linked_all.RECORD_ID.astype(str).str.strip()
+linked_all["REG_ID"]    = linked_all.REG_ID.astype(str).str.strip()
+if RECORD_FILTER is not None:
+    linked_all = linked_all[linked_all.RECORD_ID.isin({str(r) for r in RECORD_FILTER})]
+
+alerts_all = load_alerts(set(linked_all.RECORD_ID))     # from RGL_Linkage_V1
+
+a_sum = linked_all.merge(summaries, on="REG_ID", how="left")
+orph = a_sum.loc[a_sum.SUM_ID.isna(), "REG_ID"].nunique()
+if orph: print(f"[route] {orph} linked regulations have no published summary")
+a_sum = a_sum.dropna(subset=["SUM_ID"])
+a_sum["branch"] = a_sum.SUM_APPROACH.map(route)
+a_sum = a_sum.merge(alerts_all[["RECORD_ID", "alert_text"]], on="RECORD_ID", how="left")
+
+print(f"alerts={a_sum.RECORD_ID.nunique():,}  alert-summary rows={len(a_sum):,}")
+print(f"rows by branch: {a_sum.branch.value_counts().to_dict()}")
+print(f"approach in scope: {a_sum.SUM_APPROACH.value_counts(dropna=False).to_dict()}")
+per = a_sum.groupby("RECORD_ID").branch.nunique()
+print(f"alerts routing BOTH ways: {(per > 1).sum():,} of {len(per):,}")
+print(f"alerts entirely direct  : {(a_sum.groupby('RECORD_ID').branch.agg(lambda s: set(s) == {'direct'})).sum():,}")
+
+
+# %% A10c. Direct branch (Detailed / Enhanced)
+rc = e3p[["REG_ID", "SUM_ID", "APPLIC_KEY", "LIB_RISK_ID", "L1_LIB_CTRL"]].drop_duplicates()
+
+d_sum  = a_sum[a_sum.branch == "direct"]
+direct = d_sum.merge(rc, on=["REG_ID", "SUM_ID"], how="inner")
+direct["branch"]     = "direct"
+direct["decision"]   = "INHERITED"
+direct["risk_score"] = 10
+direct["reasoning"]  = ("Control Mapping Approach is " + direct.SUM_APPROACH.astype(str)
+                        + "; risk and control mapping inherited without filtering.")
+
+print(f"direct rows={len(direct):,}  alerts={direct.RECORD_ID.nunique():,}  "
+      f"risks={direct.LIB_RISK_ID.nunique():,}  controls={direct.L1_LIB_CTRL.nunique():,}")
+if len(direct):
+    print(direct.groupby("RECORD_ID")
+          .agg(summaries=("SUM_ID","nunique"), risks=("LIB_RISK_ID","nunique"),
+               controls=("L1_LIB_CTRL","nunique")).describe().to_string())
+
+
+# %% A10c. Direct branch (Detailed / Enhanced)
+rc = e3p[["REG_ID", "SUM_ID", "APPLIC_KEY", "LIB_RISK_ID", "L1_LIB_CTRL"]].drop_duplicates()
+
+d_sum  = a_sum[a_sum.branch == "direct"]
+direct = d_sum.merge(rc, on=["REG_ID", "SUM_ID"], how="inner")
+direct["branch"]     = "direct"
+direct["decision"]   = "INHERITED"
+direct["risk_score"] = 10
+direct["reasoning"]  = ("Control Mapping Approach is " + direct.SUM_APPROACH.astype(str)
+                        + "; risk and control mapping inherited without filtering.")
+
+print(f"direct rows={len(direct):,}  alerts={direct.RECORD_ID.nunique():,}  "
+      f"risks={direct.LIB_RISK_ID.nunique():,}  controls={direct.L1_LIB_CTRL.nunique():,}")
+if len(direct):
+    print(direct.groupby("RECORD_ID")
+          .agg(summaries=("SUM_ID","nunique"), risks=("LIB_RISK_ID","nunique"),
+               controls=("L1_LIB_CTRL","nunique")).describe().to_string())
+
+
+# %% A10d. Judged branch — candidates and shortlist
+LANE_A_HP = {"top_k": 15, "max_tokens": 6000, "concurrency": 10,
+             "max_retries": 3, "min_score": 5}
+
+hrisk_raw = read_helios("risk")
+hrisks = (hrisk_raw[["library_risk_id", "library_risk_title",
+                     "library_risk_description", "risk_status"]]
+          .dropna(subset=["library_risk_id"])
+          .drop_duplicates(subset=["library_risk_id"])
+          .rename(columns={"library_risk_id": "LIB_RISK_ID",
+                           "library_risk_title": "risk_title",
+                           "library_risk_description": "risk_description"}))
+hrisks["LIB_RISK_ID"] = hrisks.LIB_RISK_ID.astype(str).str.strip()
+hrisks["risk_text"] = (hrisks.risk_title.fillna("") + ". " +
+                       hrisks.risk_description.fillna("")).map(clean)
+print(f"helios library risks with text: {len(hrisks):,}  "
+      f"median len={hrisks.risk_text.str.len().median():.0f}")
+
+j_sum = a_sum[a_sum.branch == "judged"]
+cand = (j_sum[["RECORD_ID","REG_ID","SUM_ID","SUM_APPROACH","link_score","alert_text"]]
+        .merge(rc[["REG_ID","SUM_ID","LIB_RISK_ID"]].drop_duplicates(),
+               on=["REG_ID","SUM_ID"], how="inner"))
+print(f"\njudged candidates: {len(cand):,} rows, "
+      f"{cand.LIB_RISK_ID.nunique():,} distinct risks, "
+      f"{cand.RECORD_ID.nunique():,} alerts")
+
+need    = sorted(set(cand.LIB_RISK_ID) & set(hrisks.LIB_RISK_ID))
+missing = sorted(set(cand.LIB_RISK_ID) - set(hrisks.LIB_RISK_ID))
+if missing:
+    print(f"[!] {len(missing)} candidate risks have no Helios text: {missing[:5]}")
+
+rtext = hrisks.set_index("LIB_RISK_ID").risk_text.to_dict()
+risk_vecs = embed_cache(need, [rtext[i] for i in need], "helios_library_risks")
+rpos = {i: n for n, i in enumerate(need)}
+
+a_ids  = sorted(cand.RECORD_ID.unique())
+atext  = cand.drop_duplicates("RECORD_ID").set_index("RECORD_ID").alert_text.to_dict()
+a_vecs = embed_cache(a_ids, [atext[i] for i in a_ids], "alerts")   # reuses stage-1 cache
+apos   = {i: n for n, i in enumerate(a_ids)}
+
+per_alert, cos = {}, {}
+for rid in a_ids:
+    pool = [c for c in cand.loc[cand.RECORD_ID == rid, "LIB_RISK_ID"].unique() if c in rpos]
+    if not pool: continue
+    idx   = [rpos[c] for c in pool]
+    sims  = risk_vecs[idx] @ a_vecs[apos[rid]]
+    order = np.argsort(-sims)[:LANE_A_HP["top_k"]]
+    per_alert[rid] = [pool[i] for i in order]
+    for i in order:
+        cos[(rid, pool[i])] = float(sims[i])
+
+pool_sz = pd.Series({r: cand.loc[cand.RECORD_ID == r, "LIB_RISK_ID"].nunique() for r in per_alert})
+short_sz = pd.Series({k: len(v) for k, v in per_alert.items()})
+print(f"\ncandidate pool per alert : median={pool_sz.median():.0f} max={pool_sz.max()}")
+print(f"shortlist per alert      : median={short_sz.median():.0f} max={short_sz.max()}")
+print(f"alerts where top_k bites : {(pool_sz > LANE_A_HP['top_k']).sum():,} of {len(pool_sz):,}")
+
+spread = [max(cos[(r,c)] for c in per_alert[r]) - min(cos[(r,c)] for c in per_alert[r])
+          for r in per_alert if len(per_alert[r]) > 1]
+print(f"cosine spread within shortlist: median={np.median(spread):.3f}")
+
+
