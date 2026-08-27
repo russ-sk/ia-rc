@@ -285,5 +285,37 @@ for rid, grp in risk_rec.groupby("RECORD_ID"):
 
 risk_rec.to_parquet(OUT / "laneA_risk_recommendations.parquet", index=False)
 
+# %% AH1. Extract 1 — length of "Regulation Title. Regulation Description"
+C.update({"REG_TITLE": "Regulation Title", "REG_DESC": "Regulation Description"})
+
+raw1 = read_extract(1)
+e1   = standardise(raw1, ["REG_ID", "REG_STATUS", "REG_TITLE", "REG_DESC"])
+e1["REG_ID"] = e1.REG_ID.astype(str).str.strip()
+
+# E1 is at SUMMARY grain, so collapse to one row per regulation first —
+# otherwise regulations with many summaries are over-weighted in the distribution
+regs1 = e1.drop_duplicates("REG_ID").copy()
+regs1["reg_text"] = (regs1.REG_TITLE.fillna("") + ". " +
+                     regs1.REG_DESC.fillna("")).map(clean)
+
+L  = regs1.reg_text.str.len()
+QS = [.10, .20, .30, .40, .50, .60, .70, .80, .90, .95, .99]
+
+print(f"rows in E1        : {len(e1):,}")
+print(f"distinct REG_IDs  : {len(regs1):,}")
+print(f"mean {L.mean():.0f}   std {L.std():.0f}   min {L.min()}   max {L.max()}\n")
+
+for q, v in L.quantile(QS).items():
+    print(f"  p{int(q*100):<3} {v:>8,.0f}")
+
+print(f"\nunder 100 chars : {(L < 100).sum():,}  ({(L < 100).mean():.1%})")
+print(f"under 200 chars : {(L < 200).sum():,}  ({(L < 200).mean():.1%})")
+
+# title vs description separately — worth knowing which half carries the length
+print(f"\ntitle       median {regs1.REG_TITLE.fillna('').str.len().median():.0f}")
+print(f"description median {regs1.REG_DESC.fillna('').str.len().median():.0f}")
+print(f"description empty  {regs1.REG_DESC.fillna('').str.strip().eq('').sum():,}")
+
+
 
 
