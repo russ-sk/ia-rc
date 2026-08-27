@@ -449,4 +449,71 @@ if len(verdicts):
     verdicts.to_parquet(OUT / "laneA_risk_verdicts.parquet", index=False)
 print(f"\nsaved -> {OUT/'laneA_control_recommendations.parquet'}")
 
+# %% A10i. Exploded Lane A output — one row per (record, risk, control, instance)
+OUTP = Path(OUT) if isinstance(OUT, str) else OUT
+OUTP.mkdir(parents=True, exist_ok=True)
+
+# 1. collapse regulation/summary provenance to (record, risk, control) grain
+base = (both.groupby(["RECORD_ID", "LIB_RISK_ID", "L1_LIB_CTRL"])
+        .agg(branch          = ("branch", joinset),
+             decision        = ("decision", joinset),
+             risk_score      = ("risk_score", "max"),
+             max_link_score  = ("link_score", "max"),
+             via_regulations = ("REG_ID", joinset),
+             via_summaries   = ("SUM_ID", joinset),
+             via_approaches  = ("SUM_APPROACH", joinset),
+             reasoning       = ("reasoning", "first"))
+        .reset_index())
+
+# 2. risk text
+base = base.merge(hrisks[["LIB_RISK_ID", "risk_title", "risk_description"]],
+                  on="LIB_RISK_ID", how="left")
+
+# 3. control text
+base = base.merge(hcontrols, on="L1_LIB_CTRL", how="left")
+
+# 4. confidence, carried from the control-grain table so the two agree
+base = base.merge(final[["RECORD_ID", "L1_LIB_CTRL", "confidence"]].drop_duplicates(),
+                  on=["RECORD_ID", "L1_LIB_CTRL"], how="left")
+
+# 5. explode to control instances — LEFT join so a control with no instance still appears
+laneA_exploded = base.merge(hinst, on="L1_LIB_CTRL", how="left")
+laneA_exploded["has_instance"] = laneA_exploded.l1_control_id.notna()
+laneA_exploded["control_retired_flag"] = (laneA_exploded.control_title.fillna("")
+                                          .str.contains("RETIRED", case=False))
+laneA_exploded["source"] = "regmap_laneA"
+
+COLS = ["RECORD_ID",
+        "LIB_RISK_ID", "risk_title",
+        "L1_LIB_CTRL", "control_title",
+        "l1_control_id", "has_instance",
+        "branch", "decision", "confidence", "risk_score", "max_link_score",
+        "control_retired_flag",
+        "via_regulations", "via_summaries", "via_approaches",
+        "risk_description", "control_description", "reasoning", "source"]
+laneA_exploded = (laneA_exploded[COLS]
+                  .sort_values(["RECORD_ID", "confidence", "LIB_RISK_ID",
+                                "L1_LIB_CTRL", "l1_control_id"]))
+
+print(f"exploded rows: {len(laneA_exploded):,}")
+print("\nper record:")
+print(laneA_exploded.groupby("RECORD_ID").agg(
+        library_risks   = ("LIB_RISK_ID", "nunique"),
+        library_controls= ("L1_LIB_CTRL", "nunique"),
+        instances       = ("l1_control_id", "nunique"),
+        rows            = ("L1_LIB_CTRL", "size")).to_string())
+
+print(f"\ncontrols with no instance in Helios: "
+      f"{laneA_exploded.loc[~laneA_exploded.has_instance, 'L1_LIB_CTRL'].nunique()}")
+print(f"controls flagged retired: "
+      f"{laneA_exploded.loc[laneA_exploded.control_retired_flag, 'L1_LIB_CTRL'].nunique()}")
+
+print("\ninstances per library control:")
+print(laneA_exploded[laneA_exploded.has_instance]
+      .groupby("L1_LIB_CTRL").l1_control_id.nunique().describe().to_string())
+
+laneA_exploded.to_parquet(OUTP / "laneA_exploded.parquet", index=False)
+laneA_exploded.to_excel(OUTP / "laneA_exploded.xlsx", index=False)
+print(f"\nsaved -> {OUTP/'laneA_exploded.parquet'} and .xlsx")
+
 
