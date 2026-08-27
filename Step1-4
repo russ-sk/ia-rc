@@ -410,4 +410,66 @@ for rid, grp in risk_rec.groupby("RECORD_ID"):
               f"regs={r.n_regulations} sums={r.n_summaries}  {str(r.risk_title)[:70]}")
         print(f"      {str(r.risk_description)[:200]}")
 
+# %% A8b. Which risk text column is actually populated?
+cands = [c for c in hrisk_raw.columns
+         if any(k in c.lower() for k in ["title", "desc", "name", "rationale"])]
+print(f"{len(cands)} candidate text columns\n")
+
+rows = []
+for c in cands:
+    s = hrisk_raw[c].fillna("").astype(str).str.strip()
+    rows.append({"column": c, "non_empty": (s != "").sum(),
+                 "distinct": s.nunique(), "median_len": int(s.str.len().median()),
+                 "max_len": int(s.str.len().max())})
+print(pd.DataFrame(rows).sort_values("median_len", ascending=False).to_string(index=False))
+
+print("\n--- LR-00000903 across the richest few ---")
+r = hrisk_raw[hrisk_raw.library_risk_id.astype(str).str.strip() == "LR-00000903"].head(1)
+for c in ["title", "description", "library_risk_title", "library_risk_description",
+          "risk_drivers_and_controls", "risk_monitoring_requirements"]:
+    if c in r.columns:
+        print(f"\n[{c}] {str(r[c].iloc[0])[:400]}")
+
+# %% A9a. Ranked risks -> library controls
+lib_scoped = library[["RECORD_ID", "REG_ID", "SUM_ID", "APPLIC_KEY",
+                      "LIB_RISK_ID", "L1_LIB_CTRL"]].drop_duplicates()
+lib_scoped = lib_scoped[lib_scoped.L1_LIB_CTRL.astype(str).str.startswith("L1C-")]
+
+ctrl = lib_scoped.merge(
+    risk_rec[["RECORD_ID", "LIB_RISK_ID", "rank", "n_regulations",
+              "n_summaries", "corroborated", "risk_title"]],
+    on=["RECORD_ID", "LIB_RISK_ID"], how="inner")
+
+ctrl_rec = (ctrl.groupby(["RECORD_ID", "L1_LIB_CTRL"])
+    .agg(best_risk_rank = ("rank", "min"),
+         n_risks        = ("LIB_RISK_ID", "nunique"),
+         corroborated   = ("corroborated", "any"),
+         via_risks      = ("LIB_RISK_ID", joinset),
+         via_risk_titles= ("risk_title", joinset),
+         via_regulations= ("REG_ID", joinset),
+         via_summaries  = ("SUM_ID", joinset))
+    .reset_index()
+    .sort_values(["RECORD_ID", "corroborated", "best_risk_rank", "n_risks"],
+                 ascending=[True, False, True, False]))
+
+ctrl_rec["rank"] = ctrl_rec.groupby("RECORD_ID").cumcount() + 1
+ctrl_rec["source"] = "regmap"
+
+print("controls per alert:")
+print(ctrl_rec.groupby("RECORD_ID").L1_LIB_CTRL.nunique().to_string())
+print(f"\nreached via a corroborated risk: "
+      f"{ctrl_rec.corroborated.sum()} of {len(ctrl_rec)}")
+
+print("\ncumulative controls as you accept risks in rank order:")
+for rid, grp in ctrl.groupby("RECORD_ID"):
+    seen, cum = set(), []
+    for rk in sorted(grp["rank"].unique()):
+        seen |= set(grp.loc[grp["rank"] == rk, "L1_LIB_CTRL"])
+        cum.append((rk, len(seen)))
+    print(f"   {rid}: {cum}")
+
+
+
+
+
 
