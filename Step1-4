@@ -317,5 +317,97 @@ print(f"description median {regs1.REG_DESC.fillna('').str.len().median():.0f}")
 print(f"description empty  {regs1.REG_DESC.fillna('').str.strip().eq('').sum():,}")
 
 
+# %% A7c. Clean + re-rank
+BAD_IDS = {"-", "nan", "None", ""}
+sum_risks = sum_risks[~sum_risks.LIB_RISK_ID.astype(str).str.strip().isin(BAD_IDS)]
+sum_risks = sum_risks[sum_risks.LIB_RISK_ID.astype(str).str.startswith("LR-")]
+print(f"sum_risks after removing placeholders: {len(sum_risks):,} rows, "
+      f"{sum_risks.LIB_RISK_ID.nunique()} distinct library risks")
+
+laneA_risk = a_sum.merge(sum_risks, on=["REG_ID", "SUM_ID"], how="inner")
+
+risk_rec = (laneA_risk
+    .groupby(["RECORD_ID", "LIB_RISK_ID"])
+    .agg(n_regulations   = ("REG_ID", "nunique"),      # corroboration  <- primary
+         n_summaries     = ("SUM_ID", "nunique"),      # repetition     <- secondary
+         max_link_score  = ("link_score", "max"),
+         via_regulations = ("REG_ID", joinset),
+         via_summaries   = ("SUM_ID", joinset),
+         steward_areas   = ("SUM_STEWARD", joinset))
+    .reset_index()
+    .sort_values(["RECORD_ID", "n_regulations", "n_summaries", "max_link_score"],
+                 ascending=[True, False, False, False]))
+
+risk_rec["rank"] = risk_rec.groupby("RECORD_ID").cumcount() + 1
+risk_rec["corroborated"] = risk_rec.n_regulations > 1
+risk_rec["source"] = "regmap"
+
+print(f"\ncorroborated by >1 linked regulation: "
+      f"{risk_rec.corroborated.sum()} of {len(risk_rec)}")
+print(risk_rec.groupby("RECORD_ID").corroborated.sum().to_string())
+
+
+# %% A8. Helios risk text
+HELIOS_DIR = Path(DATA) / "HELIOS"     # adjust if it sits elsewhere
+print([p.name for p in HELIOS_DIR.iterdir()])
+
+
+def read_helios(stem):
+    hits = [p for p in HELIOS_DIR.iterdir()
+            if p.suffix.lower() in {".parquet", ".csv", ".xlsx"}
+            and stem.lower() in p.name.lower()]
+    if not hits:
+        raise FileNotFoundError(f"no {stem!r} in {HELIOS_DIR}: "
+                                f"{[p.name for p in HELIOS_DIR.iterdir()]}")
+    p = hits[0]
+    df = (pd.read_parquet(p) if p.suffix.lower() == ".parquet"
+          else pd.read_csv(p, dtype=str) if p.suffix.lower() == ".csv"
+          else pd.read_excel(p, dtype=str))
+    df.columns = [str(c).strip() for c in df.columns]
+    print(f"[{p.name}] rows={len(df):,} cols={len(df.columns)}")
+    return df
+
+hrisk_raw = read_helios("risk")
+print(hrisk_raw.columns.tolist())
+
+
+# Helios Risk: {country}_hsbc_helios_risk
+R_LIBRARY_RISK_ID = "library_risk_id"
+R_TITLE           = "title"
+R_DESCRIPTION     = "description"
+R_STATUS          = "risk_status"
+
+hrisk = (hrisk_raw[[R_LIBRARY_RISK_ID, R_TITLE, R_DESCRIPTION, R_STATUS]]
+         .dropna(subset=[R_LIBRARY_RISK_ID])
+         .drop_duplicates(subset=[R_LIBRARY_RISK_ID]))
+hrisk[R_LIBRARY_RISK_ID] = hrisk[R_LIBRARY_RISK_ID].astype(str).str.strip()
+
+# the identity check that decides whether the two lanes can ever converge
+a = set(sum_risks.LIB_RISK_ID.astype(str).str.strip())
+b = set(hrisk[R_LIBRARY_RISK_ID])
+print(f"\nRegMap library risks : {len(a)}")
+print(f"Helios library risks : {len(b):,}")
+print(f"overlap              : {len(a & b)}  ({len(a & b)/max(len(a),1):.1%} of RegMap's)")
+if not (a & b):
+    print(f"  RegMap sample: {sorted(a)[:3]}")
+    print(f"  Helios sample: {sorted(b)[:3]}")
+
+risk_rec = risk_rec.merge(
+    hrisk.rename(columns={R_LIBRARY_RISK_ID: "LIB_RISK_ID",
+                          R_TITLE: "risk_title",
+                          R_DESCRIPTION: "risk_description",
+                          R_STATUS: "risk_status"}),
+    on="LIB_RISK_ID", how="left")
+
+print(f"\nrecommendations with a Helios title: "
+      f"{risk_rec.risk_title.notna().sum()} / {len(risk_rec)}")
+
+for rid, grp in risk_rec.groupby("RECORD_ID"):
+    print(f"\n=== {rid} ===")
+    for _, r in grp.head(8).iterrows():
+        flag = "**" if r.corroborated else "  "
+        print(f"{flag} {r['rank']:>2}. {r.LIB_RISK_ID}  "
+              f"regs={r.n_regulations} sums={r.n_summaries}  {str(r.risk_title)[:70]}")
+        print(f"      {str(r.risk_description)[:200]}")
 
 
