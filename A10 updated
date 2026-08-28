@@ -1,0 +1,494 @@
+# %% A10a-bis. Risk rows that do NOT require a control to exist
+e3_all = e3[(e3.REG_STATUS.str.strip().str.casefold() == "published") &
+            (e3.SUM_STATUS.str.strip().str.casefold() == "published") &
+             e3.LIB_RISK_ID.astype(str).str.startswith("LR-")]        # no control filter
+
+rr = pd.concat([
+    e3_all[["REG_ID", "SUM_ID", "APPLIC_KEY", "LIB_RISK_ID"]],
+    e2p.loc[e2p.LIB_RISK_ID.astype(str).str.startswith("LR-"),
+            ["REG_ID", "SUM_ID", "LIB_RISK_ID"]].assign(APPLIC_KEY=np.nan),
+], ignore_index=True).drop_duplicates()
+
+with_ctrl = set(rc.LIB_RISK_ID.dropna())
+all_risk  = set(rr.LIB_RISK_ID.dropna())
+print(f"library risks reachable in RegMap       : {len(all_risk)}")
+print(f"   with >=1 L1 library control          : {len(all_risk & with_ctrl)}")
+print(f"   with NO control (previously dropped) : {len(all_risk - with_ctrl)}")
+print(f"   {sorted(all_risk - with_ctrl)[:15]}")
+print(f"\nrisk rows: {len(rr):,}  "
+      f"(control-bearing {rr.LIB_RISK_ID.isin(with_ctrl).sum():,} / "
+      f"control-less {(~rr.LIB_RISK_ID.isin(with_ctrl)).sum():,})")
+
+
+# %% A10c. Direct branch (Detailed / Enhanced)
+direct = (a_sum[a_sum.branch == "direct"]
+          .merge(rr, on=["REG_ID", "SUM_ID"], how="inner")
+          .merge(rc[["REG_ID", "SUM_ID", "LIB_RISK_ID", "L1_LIB_CTRL"]].drop_duplicates(),
+                 on=["REG_ID", "SUM_ID", "LIB_RISK_ID"], how="left"))
+direct["branch"]     = "direct"
+direct["decision"]   = "INHERITED"
+direct["risk_score"] = 10
+direct["reasoning"]  = ("Control Mapping Approach is " + direct.SUM_APPROACH.astype(str)
+                        + "; risk and control mapping inherited without filtering.")
+
+print(f"direct rows={len(direct):,}  alerts={direct.RECORD_ID.nunique()}  "
+      f"risks={direct.LIB_RISK_ID.nunique()}  controls={direct.L1_LIB_CTRL.nunique()}")
+print(f"   risks with no control: "
+      f"{direct.loc[direct.L1_LIB_CTRL.isna(), 'LIB_RISK_ID'].nunique()}")
+
+
+# %% A10d. Judged branch — candidates and shortlist
+LANE_A_HP = {"top_k": 15, "max_tokens": 6000, "concurrency": 10,
+             "max_retries": 3, "min_score": 5}
+
+hrisk_raw = read_helios("risk")
+hrisks = (hrisk_raw[["library_risk_id", "library_risk_title",
+                     "library_risk_description", "risk_status"]]
+          .dropna(subset=["library_risk_id"])
+          .drop_duplicates(subset=["library_risk_id"])
+          .rename(columns={"library_risk_id": "LIB_RISK_ID",
+                           "library_risk_title": "risk_title",
+                           "library_risk_description": "risk_description"}))
+hrisks["LIB_RISK_ID"] = hrisks.LIB_RISK_ID.astype(str).str.strip()
+hrisks["risk_text"] = (hrisks.risk_title.fillna("") + ". " +
+                       hrisks.risk_description.fillna("")).map(clean)
+
+cand = (a_sum[a_sum.branch == "judged"]
+        [["RECORD_ID", "REG_ID", "SUM_ID", "SUM_APPROACH", "link_score", "alert_text"]]
+        .merge(rr[["REG_ID", "SUM_ID", "LIB_RISK_ID"]].drop_duplicates(),
+               on=["REG_ID", "SUM_ID"], how="inner"))
+print(f"judged candidates: {len(cand):,} rows, "
+      f"{cand.LIB_RISK_ID.nunique()} distinct risks, {cand.RECORD_ID.nunique()} alerts")
+
+need    = sorted(set(cand.LIB_RISK_ID) & set(hrisks.LIB_RISK_ID))
+missing = sorted(set(cand.LIB_RISK_ID) - set(hrisks.LIB_RISK_ID))
+if missing:
+    print(f"[!] {len(missing)} candidate risks have no Helios text: {missing[:5]}")
+
+rtext = hrisks.set_index("LIB_RISK_ID").risk_text.to_dict()
+per_alert, cos = {}, {}
+
+if need:
+    risk_vecs = embed_cache(need, [rtext[i] for i in need], "helios_library_risks")
+    rpos = {i: n for n, i in enumerate(need)}
+
+    a_ids  = sorted(cand.RECORD_ID.unique())
+    atext  = cand.drop_duplicates("RECORD_ID").set_index("RECORD_ID").alert_text.to_dict()
+    a_vecs = embed_cache(a_ids, [atext[i] for i in a_ids], "alerts")
+    apos   = {i: n for n, i in enumerate(a_ids)}
+
+    for rid in a_ids:
+        pool = [c for c in cand.loc[cand.RECORD_ID == rid, "LIB_RISK_ID"].unique()
+                if c in rpos]
+        if not pool:
+            continue
+        idx   = [rpos[c] for c in pool]
+        sims  = risk_vecs[idx] @ a_vecs[apos[rid]]
+        order = np.argsort(-sims)[:LANE_A_HP["top_k"]]
+        per_alert[rid] = [pool[i] for i in order]
+        for i in order:
+            cos[(rid, pool[i])] = float(sims[i])
+
+    pool_sz  = pd.Series({r: cand.loc[cand.RECORD_ID == r, "LIB_RISK_ID"].nunique()
+                          for r in per_alert})
+    short_sz = pd.Series({k: len(v) for k, v in per_alert.items()})
+    print(f"\ncandidate pool per alert : median={pool_sz.median():.0f} max={pool_sz.max()}")
+    print(f"shortlist per alert      : median={short_sz.median():.0f} max={short_sz.max()}")
+    print(f"alerts where top_k bites : {(pool_sz > LANE_A_HP['top_k']).sum()} of {len(pool_sz)}")
+    spread = [max(cos[(r,c)] for c in per_alert[r]) - min(cos[(r,c)] for c in per_alert[r])
+              for r in per_alert if len(per_alert[r]) > 1]
+    if spread:
+        print(f"cosine spread within shortlist: median={np.median(spread):.3f}")
+else:
+    atext = {}
+    print("no judgeable candidates")
+
+
+# %% A10e (tail). Judge -> accepted risks -> controls LEFT-joined
+JUDGED_COLS = ["RECORD_ID", "REG_ID", "SUM_ID", "SUM_APPROACH", "LIB_RISK_ID",
+               "L1_LIB_CTRL", "link_score", "branch", "decision", "risk_score", "reasoning"]
+
+if per_alert:
+    verdicts = asyncio.get_event_loop().run_until_complete(run_judge())
+    print(f"verdicts: {verdicts.decision.value_counts().to_dict()}")
+    lk = verdicts[verdicts.decision == "LINKED"]
+    if len(lk):
+        print(f"evidence grounded on LINKED : {lk.evidence_grounded.mean():.1%}")
+        print(f"cosine rank of LINKED       : {sorted(lk.cosine_rank.dropna().tolist())}")
+
+    accepted = verdicts[(verdicts.decision == "LINKED") &
+                        (verdicts.risk_score >= LANE_A_HP["min_score"])]
+    print(f"accepted: {len(accepted)} of {len(verdicts)} verdicts")
+
+    judged = (cand.merge(accepted[["RECORD_ID", "LIB_RISK_ID", "decision",
+                                   "risk_score", "reasoning"]],
+                         on=["RECORD_ID", "LIB_RISK_ID"], how="inner")
+                  .merge(rc[["REG_ID", "SUM_ID", "LIB_RISK_ID", "L1_LIB_CTRL"]]
+                         .drop_duplicates(),
+                         on=["REG_ID", "SUM_ID", "LIB_RISK_ID"], how="left"))   # LEFT
+    judged["branch"] = "judged"
+else:
+    verdicts = pd.DataFrame()
+    judged   = pd.DataFrame(columns=JUDGED_COLS)
+
+if per_alert and missing:
+    unres = (cand[cand.LIB_RISK_ID.isin(set(missing))]
+             .merge(rc[["REG_ID", "SUM_ID", "LIB_RISK_ID", "L1_LIB_CTRL"]].drop_duplicates(),
+                    on=["REG_ID", "SUM_ID", "LIB_RISK_ID"], how="left"))        # LEFT
+    unres["decision"]   = "UNRESOLVED"
+    unres["risk_score"] = 0
+    unres["branch"]     = "judged"
+    unres["reasoning"]  = ("Library risk is referenced by RegMap but absent from Helios, "
+                           "so it has no text and could not be judged. Carried for review.")
+    judged = pd.concat([judged, unres], ignore_index=True)
+    print(f"[unresolved] carried {unres.LIB_RISK_ID.nunique()} risks")
+
+print(f"\njudged rows={len(judged):,}  "
+      f"risks={judged.LIB_RISK_ID.nunique() if len(judged) else 0}  "
+      f"controls={judged.L1_LIB_CTRL.nunique() if len(judged) else 0}  "
+      f"risks with no control="
+      f"{judged.loc[judged.L1_LIB_CTRL.isna(),'LIB_RISK_ID'].nunique() if len(judged) else 0}")
+
+
+# %% A10f. Assemble
+l1_raw = read_helios("L1_Control")
+hcontrols = (l1_raw[["l1_library_control_id", "l1_library_control_title",
+                     "l1_library_control_desc"]]
+             .dropna(subset=["l1_library_control_id"])
+             .drop_duplicates(subset=["l1_library_control_id"])
+             .rename(columns={"l1_library_control_id":    "L1_LIB_CTRL",
+                              "l1_library_control_title": "control_title",
+                              "l1_library_control_desc":  "control_description"}))
+hcontrols["L1_LIB_CTRL"] = hcontrols.L1_LIB_CTRL.astype(str).str.strip()
+
+hinst = (l1_raw[["l1_library_control_id", "name"]].dropna().drop_duplicates()
+         .rename(columns={"l1_library_control_id": "L1_LIB_CTRL", "name": "l1_control_id"}))
+hinst["L1_LIB_CTRL"] = hinst.L1_LIB_CTRL.astype(str).str.strip()
+
+both = pd.concat([d.reindex(columns=JUDGED_COLS) for d in (direct, judged) if len(d)],
+                 ignore_index=True)
+
+# ---- risk grain: confidence is decided here, not at control level ----
+risk_grain = (both.groupby(["RECORD_ID", "LIB_RISK_ID"])
+    .agg(branches        = ("branch", joinset),
+         decisions       = ("decision", joinset),
+         risk_score      = ("risk_score", "max"),
+         max_link_score  = ("link_score", "max"),
+         via_regulations = ("REG_ID", joinset),
+         via_summaries   = ("SUM_ID", joinset),
+         via_approaches  = ("SUM_APPROACH", joinset),
+         reasoning       = ("reasoning", "first"))
+    .reset_index())
+
+risk_grain["branch"] = np.where(risk_grain.branches.str.contains("direct"),
+                         np.where(risk_grain.branches.str.contains("judged"),
+                                  "both", "direct"), "judged")
+risk_grain["confidence"] = np.select(
+    [risk_grain.decisions.eq("UNRESOLVED"),
+     risk_grain.branch.isin(["direct", "both"]),
+     risk_grain.risk_score >= 8,
+     risk_grain.risk_score >= 5],
+    ["REVIEW", "HIGH", "HIGH", "MEDIUM"], default="LOW")
+risk_grain = risk_grain.merge(
+    hrisks[["LIB_RISK_ID", "risk_title", "risk_description"]], on="LIB_RISK_ID", how="left")
+
+# ---- control grain: confidence = best of the risks that reached it ----
+CONF = {"REVIEW": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+ctrl_rows = both[both.L1_LIB_CTRL.notna()]
+
+final = (ctrl_rows.groupby(["RECORD_ID", "L1_LIB_CTRL"])
+    .agg(branches        = ("branch", joinset),
+         best_risk_score = ("risk_score", "max"),
+         max_link_score  = ("link_score", "max"),
+         n_risks         = ("LIB_RISK_ID", "nunique"),
+         n_summaries     = ("SUM_ID", "nunique"),
+         via_risks       = ("LIB_RISK_ID", joinset),
+         via_summaries   = ("SUM_ID", joinset),
+         via_regulations = ("REG_ID", joinset),
+         via_approaches  = ("SUM_APPROACH", joinset))
+    .reset_index())
+final["branch"] = np.where(final.branches.str.contains("direct"),
+                    np.where(final.branches.str.contains("judged"), "both", "direct"),
+                    "judged")
+
+best = (ctrl_rows[["RECORD_ID", "LIB_RISK_ID", "L1_LIB_CTRL"]].drop_duplicates()
+        .merge(risk_grain[["RECORD_ID", "LIB_RISK_ID", "confidence"]],
+               on=["RECORD_ID", "LIB_RISK_ID"], how="left"))
+best["o"] = best.confidence.map(CONF)
+best = (best.groupby(["RECORD_ID", "L1_LIB_CTRL"])["o"].max().reset_index())
+best["confidence"] = best.o.map({v: k for k, v in CONF.items()})
+final = final.merge(best[["RECORD_ID", "L1_LIB_CTRL", "confidence"]],
+                    on=["RECORD_ID", "L1_LIB_CTRL"], how="left")
+
+final = (final.merge(hcontrols, on="L1_LIB_CTRL", how="left"))
+final["source"] = "regmap_laneA"
+final = final.sort_values(["RECORD_ID", "branch", "best_risk_score"],
+                          ascending=[True, True, False])
+final["rank"] = final.groupby("RECORD_ID").cumcount() + 1
+
+print(f"risks recommended  : {len(risk_grain):,}")
+print(f"controls recommended: {len(final):,}")
+print(f"\nrisks by confidence:\n{risk_grain.confidence.value_counts().to_string()}")
+print(f"\ncontrols by branch:\n{final.branch.value_counts().to_string()}")
+
+
+# %% A10i. Exploded output
+OUTP = Path(OUT) if isinstance(OUT, str) else OUT
+OUTP.mkdir(parents=True, exist_ok=True)
+
+links = both[["RECORD_ID", "LIB_RISK_ID", "L1_LIB_CTRL"]].drop_duplicates()
+links["has_ctrl"] = links.L1_LIB_CTRL.notna()
+any_ctrl = links.groupby(["RECORD_ID", "LIB_RISK_ID"]).has_ctrl.transform("any")
+links = links[links.has_ctrl | ~any_ctrl].drop(columns="has_ctrl")   # keep the null row
+                                                                    # only if there is no
+                                                                    # real control at all
+laneA_exploded = (risk_grain
+    .merge(links,     on=["RECORD_ID", "LIB_RISK_ID"], how="left")
+    .merge(hcontrols, on="L1_LIB_CTRL", how="left")
+    .merge(hinst,     on="L1_LIB_CTRL", how="left"))
+
+laneA_exploded["has_control"]  = laneA_exploded.L1_LIB_CTRL.notna()
+laneA_exploded["has_instance"] = laneA_exploded.l1_control_id.notna()
+laneA_exploded["control_retired_flag"] = (laneA_exploded.control_title.fillna("")
+                                          .str.contains("RETIRED", case=False))
+laneA_exploded["source"] = "regmap_laneA"
+
+COLS = ["RECORD_ID", "LIB_RISK_ID", "risk_title",
+        "L1_LIB_CTRL", "control_title", "l1_control_id",
+        "has_control", "has_instance", "control_retired_flag",
+        "branch", "decisions", "confidence", "risk_score", "max_link_score",
+        "via_regulations", "via_summaries", "via_approaches",
+        "risk_description", "control_description", "reasoning", "source"]
+laneA_exploded = laneA_exploded[COLS].sort_values(
+    ["RECORD_ID", "confidence", "LIB_RISK_ID", "L1_LIB_CTRL", "l1_control_id"])
+
+laneA_risks = (laneA_exploded.groupby(["RECORD_ID", "LIB_RISK_ID"])
+    .agg(risk_title      = ("risk_title", "first"),
+         branch          = ("branch", "first"),
+         confidence      = ("confidence", "first"),
+         n_controls      = ("L1_LIB_CTRL", "nunique"),
+         n_instances     = ("l1_control_id", "nunique"),
+         via_regulations = ("via_regulations", "first"))
+    .reset_index())
+
+print(f"exploded rows: {len(laneA_exploded):,}")
+print("\nper record:")
+print(laneA_exploded.groupby("RECORD_ID").agg(
+        library_risks    = ("LIB_RISK_ID", "nunique"),
+        library_controls = ("L1_LIB_CTRL", "nunique"),
+        instances        = ("l1_control_id", "nunique"),
+        rows             = ("LIB_RISK_ID", "size")).to_string())
+print(f"\nrisks with NO control: {(laneA_risks.n_controls == 0).sum()} "
+      f"of {len(laneA_risks)}")
+print(laneA_risks[laneA_risks.n_controls == 0]
+      .head(15)[["RECORD_ID", "LIB_RISK_ID", "risk_title", "confidence"]]
+      .to_string(index=False))
+
+laneA_exploded.to_parquet(OUTP / "laneA_exploded.parquet", index=False)
+laneA_risks.to_parquet(OUTP / "laneA_risks.parquet", index=False)
+final.to_parquet(OUTP / "laneA_control_recommendations.parquet", index=False)
+laneA_exploded.to_excel(OUTP / "laneA_exploded.xlsx", index=False)
+print(f"\nsaved -> {OUTP}")
+
+# %% A10i. Exploded output
+from pathlib import Path
+OUTP = Path(OUT) if isinstance(OUT, str) else OUT
+OUTP.mkdir(parents=True, exist_ok=True)
+
+links = both[["RECORD_ID", "LIB_RISK_ID", "L1_LIB_CTRL"]].drop_duplicates()
+links["has_ctrl"] = links.L1_LIB_CTRL.notna()
+any_ctrl = links.groupby(["RECORD_ID", "LIB_RISK_ID"]).has_ctrl.transform("any")
+links = links[links.has_ctrl | ~any_ctrl].drop(columns="has_ctrl")
+
+laneA_exploded = (risk_grain
+    .merge(links,     on=["RECORD_ID", "LIB_RISK_ID"], how="left")
+    .merge(hcontrols, on="L1_LIB_CTRL", how="left")
+    .merge(hinst,     on="L1_LIB_CTRL", how="left"))
+
+laneA_exploded["has_control"]  = laneA_exploded.L1_LIB_CTRL.notna()
+laneA_exploded["has_instance"] = laneA_exploded.l1_control_id.notna()
+laneA_exploded["control_retired_flag"] = (
+    laneA_exploded.control_title.fillna("").str.contains("RETIRED", case=False)
+    | laneA_exploded.get("control_status", pd.Series(index=laneA_exploded.index, dtype=object))
+      .fillna("").astype(str).str.contains("RETIRE", case=False))
+laneA_exploded["source"] = "regmap_laneA"
+
+COLS = ["RECORD_ID", "LIB_RISK_ID", "risk_title",
+        "L1_LIB_CTRL", "control_title", "l1_control_id",
+        "has_control", "has_instance", "control_retired_flag",
+        "branch", "decisions", "confidence", "risk_score", "max_link_score",
+        "via_regulations", "via_summaries", "via_approaches",
+        "risk_description", "control_description", "reasoning", "source"]
+COLS = [c for c in COLS if c in laneA_exploded.columns]
+laneA_exploded = laneA_exploded[COLS].sort_values(
+    ["RECORD_ID", "confidence", "LIB_RISK_ID", "L1_LIB_CTRL", "l1_control_id"])
+
+laneA_risks = (laneA_exploded.groupby(["RECORD_ID", "LIB_RISK_ID"])
+    .agg(risk_title      = ("risk_title", "first"),
+         branch          = ("branch", "first"),
+         confidence      = ("confidence", "first"),
+         n_controls      = ("L1_LIB_CTRL", "nunique"),
+         n_instances     = ("l1_control_id", "nunique"),
+         via_regulations = ("via_regulations", "first"))
+    .reset_index())
+
+print(f"exploded rows: {len(laneA_exploded):,}")
+print("\nper record:")
+print(laneA_exploded.groupby("RECORD_ID").agg(
+        library_risks    = ("LIB_RISK_ID", "nunique"),
+        library_controls = ("L1_LIB_CTRL", "nunique"),
+        instances        = ("l1_control_id", "nunique"),
+        rows             = ("LIB_RISK_ID", "size")).to_string())
+print(f"\nrisks with NO control : {(laneA_risks.n_controls == 0).sum()} of {len(laneA_risks)}")
+print(f"controls with no text : {laneA_exploded.loc[laneA_exploded.has_control & "
+      f"laneA_exploded.control_title.isna(), 'L1_LIB_CTRL'].nunique()}")
+
+laneA_exploded.to_parquet(OUTP / "laneA_exploded.parquet", index=False)
+laneA_risks.to_parquet(OUTP / "laneA_risks.parquet", index=False)
+final.to_parquet(OUTP / "laneA_control_recommendations.parquet", index=False)
+laneA_exploded.to_excel(OUTP / "laneA_exploded.xlsx", index=False)
+print(f"\nsaved -> {OUTP}")
+
+
+# %% A11a. Golden -> flat triples
+import ast, re
+
+GOLDEN_RC_PATH = "../data/golden_risk_control.parquet"   # <-- adjust
+G_RECORD, G_REG, G_DICT = "Record ID", "Regulation ID", "Risk_Control_dict"
+
+# A risk key whose value is None: treat as "risk applies, no controls mapped".
+# Set False if A11b shows the key sets are identical across records (= enumeration).
+GOLDEN_NONE_RISK_IS_POSITIVE = True
+
+BAD = {"-", "", "nan", "none", "null", "<na>"}
+
+def _id(x):
+    if x is None: return None
+    s = str(x).strip()
+    return None if s.lower() in BAD else s
+
+def parse_rc(v):
+    if isinstance(v, dict): return v
+    if v is None or (isinstance(v, float) and pd.isna(v)): return {}
+    s = re.sub(r"array\(\s*(\[.*?\])\s*(?:,\s*dtype=[^)]*)?\)", r"\1", str(v), flags=re.S)
+    s = s.replace("nan", "None")
+    try:
+        d = ast.literal_eval(s)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def flatten_rc(d):
+    rows = []
+    for risk, ctrls in (d or {}).items():
+        r = _id(risk)
+        if r is None: continue
+        if not isinstance(ctrls, dict) or not ctrls:
+            if GOLDEN_NONE_RISK_IS_POSITIVE:
+                rows.append((r, None, None))
+            continue
+        for ctrl, insts in ctrls.items():
+            c = _id(ctrl)
+            if c is None:
+                if GOLDEN_NONE_RISK_IS_POSITIVE: rows.append((r, None, None))
+                continue
+            seq = [] if insts is None else (
+                list(insts) if hasattr(insts, "__iter__") and not isinstance(insts, str)
+                else [insts])
+            seq = [i for i in (_id(x) for x in seq) if i is not None]
+            rows += [(r, c, i) for i in seq] if seq else [(r, c, None)]
+    return rows
+
+gc_raw = pd.read_parquet(GOLDEN_RC_PATH)
+gc_raw[G_RECORD] = gc_raw[G_RECORD].astype(str).str.strip()
+
+grows = []
+for _, row in gc_raw.iterrows():
+    for r, c, i in flatten_rc(parse_rc(row[G_DICT])):
+        grows.append({"RECORD_ID": row[G_RECORD], "REG_ID": _id(row.get(G_REG)),
+                      "LIB_RISK_ID": r, "L1_LIB_CTRL": c, "L1_CTRL": i})
+gold = pd.DataFrame(grows).drop_duplicates()
+
+print(f"golden rows in file : {len(gc_raw):,}")
+print(f"golden records      : {gold.RECORD_ID.nunique():,}")
+print(f"flattened triples   : {len(gold):,}")
+print(f"  library risks     : {gold.LIB_RISK_ID.nunique():,}")
+print(f"  library controls  : {gold.L1_LIB_CTRL.nunique():,}")
+print(f"  risks with no ctrl: {gold.loc[gold.L1_LIB_CTRL.isna(),'LIB_RISK_ID'].nunique():,}")
+
+# %% A11b. Enumeration check — decides GOLDEN_NONE_RISK_IS_POSITIVE
+keysets, rows = {}, []
+for _, r in gc_raw.iterrows():
+    d = parse_rc(r[G_DICT])
+    risks  = {_id(k) for k in d} - {None}
+    mapped = {_id(k) for k, v in d.items() if isinstance(v, dict) and v} - {None}
+    rid = str(r[G_RECORD]).strip()
+    keysets.setdefault(rid, set()).update(risks)
+    rows.append({"RECORD_ID": rid, "risk_keys": len(risks),
+                 "risks_mapped": len(mapped), "risks_None": len(risks - mapped)})
+
+print(pd.DataFrame(rows).groupby("RECORD_ID")
+      [["risk_keys","risks_mapped","risks_None"]].max().to_string())
+
+ks = list(keysets.values())
+n_distinct = len({frozenset(s) for s in ks})
+print(f"\ndistinct risk-key sets across records : {n_distinct}")
+print(f"intersection across all records       : {len(set.intersection(*ks))}")
+print(f"union across all records              : {len(set.union(*ks))}")
+print("\n-> 1 distinct set means pure enumeration; set "
+      "GOLDEN_NONE_RISK_IS_POSITIVE = False in A11a and re-run it.")
+
+
+# %% A11c. Lane A vs golden — flat set comparison
+RECORDS = sorted({str(r) for r in KEEP_RECORDS} & set(gold.RECORD_ID))
+print(f"scoring {len(RECORDS)} records: {RECORDS}")
+absent = {str(r) for r in KEEP_RECORDS} - set(gold.RECORD_ID)
+if absent: print(f"[!] not in golden, unscorable: {sorted(absent)}")
+
+pred = laneA_exploded.copy()
+pred["RECORD_ID"] = pred.RECORD_ID.astype(str).str.strip()
+
+def sets_for(df, record, col):
+    s = df.loc[df.RECORD_ID.astype(str).str.strip() == record, col]
+    return set(s.dropna().astype(str).str.strip()) - BAD
+
+def score(p, g):
+    tp, fp, fn = len(p & g), len(p - g), len(g - p)
+    pr = tp/(tp+fp) if (tp+fp) else np.nan
+    rc_ = tp/(tp+fn) if (tp+fn) else np.nan
+    f1 = 2*pr*rc_/(pr+rc_) if (pr and rc_ and pr+rc_) else np.nan
+    return tp, fp, fn, pr, rc_, f1
+
+rows = []
+for level, col in [("library_risk", "LIB_RISK_ID"), ("l1_library_control", "L1_LIB_CTRL")]:
+    all_p, all_g = set(), set()
+    for rid in RECORDS:
+        g, p = sets_for(gold, rid, col), sets_for(pred, rid, col)
+        all_g |= {(rid, x) for x in g}; all_p |= {(rid, x) for x in p}
+        tp, fp, fn, pr, rc_, f1 = score(p, g)
+        rows.append({"RECORD_ID": rid, "level": level, "n_gold": len(g), "n_laneA": len(p),
+                     "matched": tp, "extra_fp": fp, "missed_fn": fn,
+                     "precision": pr, "recall": rc_, "f1": f1})
+    tp, fp, fn, pr, rc_, f1 = score(all_p, all_g)
+    rows.append({"RECORD_ID": "ALL", "level": level, "n_gold": len(all_g),
+                 "n_laneA": len(all_p), "matched": tp, "extra_fp": fp, "missed_fn": fn,
+                 "precision": pr, "recall": rc_, "f1": f1})
+
+res = pd.DataFrame(rows)
+print("\n" + res.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+res.to_csv(OUTP / "laneA_eval_flat.csv", index=False)
+
+
+# %% A11d. Matched / missed / extra
+for level, col in [("LIBRARY RISK", "LIB_RISK_ID"), ("L1 LIBRARY CONTROL", "L1_LIB_CTRL")]:
+    print(f"\n{'='*74}\n{level}\n{'='*74}")
+    for rid in RECORDS:
+        g, p = sets_for(gold, rid, col), sets_for(pred, rid, col)
+        print(f"\n--- {rid} ---   golden={len(g)}  laneA={len(p)}")
+        print(f"  matched ({len(g & p)}): {sorted(g & p)}")
+        print(f"  missed  ({len(g - p)}): {sorted(g - p)}")
+        print(f"  extra   ({len(p - g)}): {sorted(p - g)}")
+
+
+
+
