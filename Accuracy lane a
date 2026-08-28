@@ -1,0 +1,24 @@
+# %% pin the evaluation to the working set
+EVAL_RECORDS = sorted({str(r) for r in KEEP_RECORDS} & set(gold.RECORD_ID))
+print(f"scoring {len(EVAL_RECORDS)} records: {EVAL_RECORDS}")
+
+absent = {str(r) for r in KEEP_RECORDS} - set(gold.RECORD_ID)
+if absent:
+    print(f"[!] not in golden, cannot be scored: {sorted(absent)}")
+
+gold_e = gold[gold.RECORD_ID.isin(EVAL_RECORDS)]
+pred_e = pred[pred.RECORD_ID.isin(EVAL_RECORDS)]
+
+
+
+rows = []
+for name, col in LEVELS:
+    m = prf(pairs(pred_e, col), pairs(gold_e, col)); m["level"] = name; m["scope"] = "3 records"
+    rows.append(m)
+    for rid in EVAL_RECORDS:
+        p = {x for r, x in pairs(pred_e, col) if r == rid}
+        g = {x for r, x in pairs(gold_e, col) if r == rid}
+        m = prf(p, g); m["level"] = name; m["scope"] = rid
+        rows.append(m)
+print(pd.DataFrame(rows)[["scope","level","tp","fp","fn","precision","recall","f1"]]
+      .to_string(index=False, float_format=lambda x: f"{x:.3f}"))
