@@ -22,3 +22,56 @@ for name, col in LEVELS:
         rows.append(m)
 print(pd.DataFrame(rows)[["scope","level","tp","fp","fn","precision","recall","f1"]]
       .to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+
+# %% Lane A vs golden — flat set comparison
+RECORDS = sorted({str(r) for r in KEEP_RECORDS})
+
+def sets_for(df, record, col):
+    s = df.loc[df.RECORD_ID.astype(str).str.strip() == record, col]
+    return set(s.dropna().astype(str).str.strip()) - {"-", ""}
+
+def score(pred_set, gold_set):
+    tp = len(pred_set & gold_set)
+    fp = len(pred_set - gold_set)
+    fn = len(gold_set - pred_set)
+    p  = tp / (tp + fp) if (tp + fp) else np.nan
+    r  = tp / (tp + fn) if (tp + fn) else np.nan
+    f  = 2*p*r/(p+r) if (p and r and p+r) else np.nan
+    return tp, fp, fn, p, r, f
+
+rows = []
+for level, col in [("library_risk", "LIB_RISK_ID"), ("l1_library_control", "L1_LIB_CTRL")]:
+    all_p, all_g = set(), set()
+    for rid in RECORDS:
+        g = sets_for(gold, rid, col)
+        p = sets_for(pred, rid, col)
+        all_g |= {(rid, x) for x in g}
+        all_p |= {(rid, x) for x in p}
+        tp, fp, fn, pr, rc_, f1 = score(p, g)
+        rows.append({"RECORD_ID": rid, "level": level,
+                     "n_gold": len(g), "n_laneA": len(p),
+                     "matched": tp, "extra_fp": fp, "missed_fn": fn,
+                     "precision": pr, "recall": rc_, "f1": f1})
+    tp, fp, fn, pr, rc_, f1 = score(all_p, all_g)
+    rows.append({"RECORD_ID": "ALL 3", "level": level,
+                 "n_gold": len(all_g), "n_laneA": len(all_p),
+                 "matched": tp, "extra_fp": fp, "missed_fn": fn,
+                 "precision": pr, "recall": rc_, "f1": f1})
+
+res = pd.DataFrame(rows)
+print(res.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+# %% the sets themselves
+for level, col in [("LIBRARY RISK", "LIB_RISK_ID"), ("L1 LIBRARY CONTROL", "L1_LIB_CTRL")]:
+    print(f"\n{'='*72}\n{level}\n{'='*72}")
+    for rid in RECORDS:
+        g = sets_for(gold, rid, col)
+        p = sets_for(pred, rid, col)
+        print(f"\n--- {rid} ---   golden={len(g)}  laneA={len(p)}")
+        print(f"  matched ({len(g & p)}) : {sorted(g & p)}")
+        print(f"  missed  ({len(g - p)}) : {sorted(g - p)}")
+        print(f"  extra   ({len(p - g)}) : {sorted(p - g)}")
+
+
+
