@@ -194,3 +194,61 @@ print(f"  library risks={len(hrisks):,}  controls with text={len(hcontrols):,} "
       f"(rtcl fill={len(_gap):,})  instance rows={len(hinst_text):,}")
 print(f"  RegMap ctrls with text: {len(set(e3p.L1_LIB_CTRL.dropna()) & set(hcontrols.L1_LIB_CTRL))}"
       f" / {e3p.L1_LIB_CTRL.nunique()}")
+
+def _safe_parquet(path, columns=None):
+    """Read parquet, coercing any Arrow extension type pandas can't map (e.g.
+    BigQuery 'dbdate') to string. Works whether or not `columns` is given."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(path)
+    names = pf.schema.names
+    cols = [c for c in columns if c in names] if columns else names
+    tbl = pq.read_table(path, columns=cols)
+
+    new_cols, new_names = [], []
+    for field in tbl.schema:
+        col = tbl.column(field.name)
+        try:
+            # will the pandas dtype resolve? if not, cast to string in Arrow
+            pd.api.types.pandas_dtype(field.type.to_pandas_dtype())
+            new_cols.append(col)
+        except Exception:
+            new_cols.append(pa.compute.cast(col, pa.string()))
+        new_names.append(field.name)
+    tbl = pa.table(new_cols, names=new_names)
+    return tbl.to_pandas(types_mapper=None)
+
+
+def _read_any(path, columns=None):
+    if path.suffix.lower() == ".parquet":
+        try:
+            df = _safe_parquet(path, columns)
+        except Exception:
+            # last-resort fallback: read all as strings
+            import pyarrow.parquet as pq, pyarrow as pa
+            tbl = pq.read_table(path)
+            tbl = pa.table([pa.compute.cast(tbl.column(n), pa.string()) for n in tbl.schema.names],
+                           names=tbl.schema.names)
+            df = tbl.to_pandas()
+            if columns:
+                df = df[[c for c in columns if c in df.columns]]
+    else:
+        df = (pd.read_csv(path, dtype=str) if path.suffix.lower() == ".csv"
+              else pd.read_excel(path, dtype=str))
+        if columns:
+            df = df[[c for c in columns if c in df.columns]]
+    df.columns = [str(c).strip() for c in df.columns]
+    print(f"[load] {path.name}: rows={len(df):,} cols={len(df.columns)}")
+    return df
+
+
+def read_regmap(n):
+    hits = [x for x in REGMAP_DIR.iterdir()
+            if x.suffix.lower() in {".xlsx",".xls",".csv",".parquet"}
+            and re.search(rf"extract\s*_?{n}\b", x.name, flags=re.I)]
+    return _read_any(sorted(hits)[0])
+
+
+def read_helios(stem, usecols=None):
+    return _read_any(_find(HELIOS_DIR, stem), columns=usecols)
+
