@@ -152,3 +152,92 @@ final.to_parquet(OUTP / "laneA_control_recommendations.parquet", index=False)
 laneA_exploded.to_excel(OUTP / "laneA_exploded.xlsx", index=False)
 print(f"\nsaved -> {OUTP}")
 
+# %% A13. Precision / recall — flat, per record, three levels ------------------
+RECORDS = sorted({str(r) for r in (KEEP_RECORDS or gold.RECORD_ID.unique())}
+                 & set(gold.RECORD_ID))
+print(f"scoring {len(RECORDS)} records: {RECORDS}")
+absent = {str(r) for r in (KEEP_RECORDS or [])} - set(gold.RECORD_ID)
+if absent:
+    print(f"[!] not in golden, unscorable: {sorted(absent)}")
+
+pred = laneA_exploded.copy()
+pred["RECORD_ID"] = pred.RECORD_ID.astype(str).str.strip()
+
+# (label, column in gold, column in Lane A output)
+LEVELS = [("library_risk",        "LIB_RISK_ID",  "LIB_RISK_ID"),
+          ("l1_library_control",  "L1_LIB_CTRL",  "L1_LIB_CTRL"),
+          ("l1_control_instance", "L1_CTRL",      "l1_control_id")]
+
+
+def sets_for(df, rid, col):
+    if col not in df.columns:
+        return set()
+    s = df.loc[df.RECORD_ID.astype(str).str.strip() == rid, col]
+    return {x for x in s.dropna().astype(str).str.strip() if x.lower() not in PLACEHOLDER}
+
+
+def score(p, g):
+    tp, fp, fn = len(p & g), len(p - g), len(g - p)
+    pr  = tp / (tp + fp) if (tp + fp) else np.nan
+    rc_ = tp / (tp + fn) if (tp + fn) else np.nan
+    f1  = 2 * pr * rc_ / (pr + rc_) if (pr and rc_ and pr + rc_) else np.nan
+    jac = tp / (tp + fp + fn) if (tp + fp + fn) else np.nan
+    return tp, fp, fn, pr, rc_, f1, jac
+
+
+rows = []
+for level, gcol, pcol in LEVELS:
+    ap, ag = set(), set()
+    for rid in RECORDS:
+        g, p = sets_for(gold, rid, gcol), sets_for(pred, rid, pcol)
+        ag |= {(rid, x) for x in g}
+        ap |= {(rid, x) for x in p}
+        tp, fp, fn, pr, rc_, f1, jac = score(p, g)
+        rows.append(dict(RECORD_ID=rid, level=level, n_gold=len(g), n_laneA=len(p),
+                         matched=tp, extra_fp=fp, missed_fn=fn,
+                         precision=pr, recall=rc_, f1=f1, jaccard=jac))
+    tp, fp, fn, pr, rc_, f1, jac = score(ap, ag)
+    rows.append(dict(RECORD_ID="ALL", level=level, n_gold=len(ag), n_laneA=len(ap),
+                     matched=tp, extra_fp=fp, missed_fn=fn,
+                     precision=pr, recall=rc_, f1=f1, jaccard=jac))
+
+res = pd.DataFrame(rows)
+print("\nA13 CHECK")
+print(res.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+res.to_csv(OUTP / "laneA_eval_flat.csv", index=False)
+
+# ---- matched / missed / extra, per level ----
+for level, gcol, pcol in LEVELS:
+    print(f"\n{'='*76}\n{level.upper()}\n{'='*76}")
+    for rid in RECORDS:
+        g, p = sets_for(gold, rid, gcol), sets_for(pred, rid, pcol)
+        print(f"\n--- {rid} ---  golden={len(g)} laneA={len(p)}")
+        print(f"  matched ({len(g & p)}): {sorted(g & p)[:40]}")
+        print(f"  missed  ({len(g - p)}): {sorted(g - p)[:40]}")
+        print(f"  extra   ({len(p - g)}): {sorted(p - g)[:40]}")
+
+# ---- instance agreement within controls both sides agree on ----
+print(f"\n{'='*76}\nINSTANCE SETS, FOR CONTROLS PRESENT IN BOTH\n{'='*76}")
+irows = []
+for rid in RECORDS:
+    common = sets_for(gold, rid, "L1_LIB_CTRL") & sets_for(pred, rid, "L1_LIB_CTRL")
+    for c in sorted(common):
+        gi = {x for x in gold.loc[(gold.RECORD_ID == rid) &
+                                  (gold.L1_LIB_CTRL == c), "L1_CTRL"].dropna()
+              if str(x).lower() not in PLACEHOLDER}
+        pi = {x for x in pred.loc[(pred.RECORD_ID == rid) &
+                                  (pred.L1_LIB_CTRL == c), "l1_control_id"].dropna()
+              if str(x).lower() not in PLACEHOLDER}
+        irows.append({"RECORD_ID": rid, "L1_LIB_CTRL": c,
+                      "n_gold": len(gi), "n_laneA": len(pi),
+                      "identical": gi == pi, "extra": len(pi - gi), "missing": len(gi - pi)})
+inst_cmp = pd.DataFrame(irows)
+if len(inst_cmp):
+    print(f"controls compared: {len(inst_cmp)}   "
+          f"instance sets identical: {inst_cmp.identical.mean():.1%}")
+    print(inst_cmp.head(20).to_string(index=False))
+    inst_cmp.to_csv(OUTP / "laneA_instance_agreement.csv", index=False)
+else:
+    print("no controls present on both sides")
+
+
