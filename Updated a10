@@ -1,0 +1,133 @@
+# %% A12. Golden — already exploded, no dict parsing
+GOLDEN_PATH = "../data/golden_dataset_US_exploded.pkl"
+
+G = {"RECORD_ID":   "Record ID",
+     "REG_ID":      "Regulation ID",
+     "SUM_ID":      "RegMap Regulation Summary ID",
+     "OBL_ID":      "RegMap Obligation ID",
+     "LIB_RISK_ID": "Regulation Summary Library Risk ID Number",
+     "L1_LIB_CTRL": "Regulation Summary L1 Library Control ID Number",
+     "L1_CTRL":     "L1 Control ID"}
+
+g_raw = pd.read_pickle(GOLDEN_PATH)
+g_raw.columns = [str(c).strip() for c in g_raw.columns]
+print(f"[load] {GOLDEN_PATH}: rows={len(g_raw):,} cols={len(g_raw.columns)}")
+print(g_raw.columns.tolist())
+
+# resolve leniently so minor header drift doesn't break the run
+ren = {}
+for short, label in G.items():
+    try:
+        ren[resolve(g_raw, label)] = short
+    except KeyError:
+        print(f"[!] could not resolve {label!r} -> {short}")
+gold = g_raw.rename(columns=ren)[[s for s in G if s in ren.values()]].copy()
+
+for c in ["RECORD_ID", "REG_ID", "SUM_ID", "OBL_ID",
+          "LIB_RISK_ID", "L1_LIB_CTRL", "L1_CTRL"]:
+    if c in gold.columns:
+        s = gold[c].astype(str).str.strip()
+        gold[c] = s.where(~s.str.lower().isin(PLACEHOLDER), np.nan)
+
+gold = gold.drop_duplicates()
+
+print("\nA12 CHECK")
+print(f"  rows after clean : {len(gold):,}")
+print(f"  records          : {gold.RECORD_ID.nunique():,}")
+print(f"  library risks    : {gold.LIB_RISK_ID.nunique():,}")
+print(f"  library controls : {gold.L1_LIB_CTRL.nunique():,}")
+print(f"  control instances: {gold.L1_CTRL.nunique():,}")
+print(f"  rows with no control : {gold.L1_LIB_CTRL.isna().sum():,}")
+print(f"  rows with no instance: {gold.L1_CTRL.isna().sum():,}")
+print("\nper record in scope:")
+print(gold[gold.RECORD_ID.isin({str(r) for r in KEEP_RECORDS})]
+      .groupby("RECORD_ID").agg(rows=("LIB_RISK_ID", "size"),
+                                risks=("LIB_RISK_ID", "nunique"),
+                                controls=("L1_LIB_CTRL", "nunique"),
+                                instances=("L1_CTRL", "nunique")).to_string())
+# %% A12b. Are the golden risks enumerated, or all genuinely mapped?
+per = (gold.groupby(["RECORD_ID", "LIB_RISK_ID"])
+       .agg(rows=("L1_LIB_CTRL", "size"),
+            controls=("L1_LIB_CTRL", "nunique"),
+            instances=("L1_CTRL", "nunique")).reset_index())
+per["mapped"] = per.controls > 0
+
+keysets   = per.groupby("RECORD_ID").LIB_RISK_ID.apply(set).to_dict()
+mappedset = (per[per.mapped].groupby("RECORD_ID").LIB_RISK_ID.apply(set).to_dict())
+
+print(per.groupby("RECORD_ID").agg(risk_keys=("LIB_RISK_ID", "nunique"),
+                                   mapped=("mapped", "sum")).head(20).to_string())
+print(f"\nrecords                 : {len(keysets)}")
+print(f"distinct risk-key SETS  : {len({frozenset(s) for s in keysets.values()})}")
+print(f"distinct MAPPED sets    : {len({frozenset(s) for s in mappedset.values()})}")
+if len(keysets) > 1:
+    print(f"intersection of key sets: {len(set.intersection(*keysets.values()))}")
+    print(f"union of key sets       : {len(set.union(*keysets.values()))}")
+print("\n-> one distinct key set but many distinct mapped sets means the risk list is "
+      "an enumeration and only the mapped ones are true positives")
+
+# does the pattern hold for your three records?
+for rid in sorted({str(r) for r in KEEP_RECORDS} & set(keysets)):
+    k, m = keysets[rid], mappedset.get(rid, set())
+    p = sets_for(pred, rid, "LIB_RISK_ID") if "pred" in dir() else set()
+    print(f"\n--- {rid} ---  keys={len(k)}  mapped={len(m)}  unmapped={len(k-m)}")
+    print(f"  Lane A returned {len(p)};  ∩mapped={len(p & m)}  ∩unmapped={len(p & (k-m))}")
+
+
+# %% A13. Precision / recall — flat, per record, three levels
+RECORDS = sorted({str(r) for r in (KEEP_RECORDS or gold.RECORD_ID.unique())}
+                 & set(gold.RECORD_ID))
+print(f"scoring {len(RECORDS)} records: {RECORDS}")
+
+pred = laneA_exploded.copy()
+pred["RECORD_ID"] = pred.RECORD_ID.astype(str).str.strip()
+
+LEVELS = [("library_risk",        "LIB_RISK_ID",  "LIB_RISK_ID"),
+          ("l1_library_control",  "L1_LIB_CTRL",  "L1_LIB_CTRL"),
+          ("l1_control_instance", "L1_CTRL",      "l1_control_id")]
+
+def sets_for(df, rid, col):
+    if col not in df.columns:
+        return set()
+    s = df.loc[df.RECORD_ID.astype(str).str.strip() == rid, col]
+    return {x for x in s.dropna().astype(str).str.strip() if x.lower() not in PLACEHOLDER}
+
+def score(p, g):
+    tp, fp, fn = len(p & g), len(p - g), len(g - p)
+    pr  = tp / (tp + fp) if (tp + fp) else np.nan
+    rc_ = tp / (tp + fn) if (tp + fn) else np.nan
+    f1  = 2 * pr * rc_ / (pr + rc_) if (pr and rc_ and pr + rc_) else np.nan
+    jac = tp / (tp + fp + fn) if (tp + fp + fn) else np.nan
+    return tp, fp, fn, pr, rc_, f1, jac
+
+rows = []
+for level, gcol, pcol in LEVELS:
+    ap, ag = set(), set()
+    for rid in RECORDS:
+        g, p = sets_for(gold, rid, gcol), sets_for(pred, rid, pcol)
+        ag |= {(rid, x) for x in g}; ap |= {(rid, x) for x in p}
+        tp, fp, fn, pr, rc_, f1, jac = score(p, g)
+        rows.append(dict(RECORD_ID=rid, level=level, n_gold=len(g), n_laneA=len(p),
+                         matched=tp, extra_fp=fp, missed_fn=fn,
+                         precision=pr, recall=rc_, f1=f1, jaccard=jac))
+    tp, fp, fn, pr, rc_, f1, jac = score(ap, ag)
+    rows.append(dict(RECORD_ID="ALL", level=level, n_gold=len(ag), n_laneA=len(ap),
+                     matched=tp, extra_fp=fp, missed_fn=fn,
+                     precision=pr, recall=rc_, f1=f1, jaccard=jac))
+
+res = pd.DataFrame(rows)
+print("\nA13 CHECK")
+print(res.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+res.to_csv(OUTP / "laneA_eval_flat.csv", index=False)
+
+for level, gcol, pcol in LEVELS:
+    print(f"\n{'='*76}\n{level.upper()}\n{'='*76}")
+    for rid in RECORDS:
+        g, p = sets_for(gold, rid, gcol), sets_for(pred, rid, pcol)
+        print(f"\n--- {rid} ---  golden={len(g)} laneA={len(p)}")
+        print(f"  matched ({len(g & p)}): {sorted(g & p)[:40]}")
+        print(f"  missed  ({len(g - p)}): {sorted(g - p)[:40]}")
+        print(f"  extra   ({len(p - g)}): {sorted(p - g)[:40]}")
+
+
+
