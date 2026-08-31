@@ -49,4 +49,69 @@ for rid in zero[:6]:
     print(f"  laneA  controls   : {sorted(pc_)[:8]}")
     print(f"  format sample gold={list(gc_)[:2]}  pred={list(pc_)[:2]}")
 
+# %% STAGE-1 DIAG 1 — the 32 no-linked records vs their golden regulations
+no_link = diag.loc[diag.cause.str.startswith("3"), "RECORD_ID"].tolist()
+print(f"records with no LINKED regulation: {len(no_link)}")
+
+# golden regulation(s) per record  (needs REG_ID resolved in A11 gold)
+if "REG_ID" not in gold.columns:
+    print("[!] gold has no REG_ID column — re-run A11 making sure Regulation ID resolved")
+gold_reg = (gold.dropna(subset=["REG_ID"])
+            .groupby("RECORD_ID").REG_ID.apply(lambda s: set(s.astype(str).str.strip()))
+            .to_dict())
+
+pc = pairs.copy(); pc["RECORD_ID"] = pc.RECORD_ID.astype(str).str.strip()
+pc["REG_ID"] = pc.REG_ID.astype(str).str.strip()
+
+for rid in no_link[:5]:
+    print(f"\n--- {rid} ---")
+    print(f"  golden regs        : {sorted(gold_reg.get(rid, set()))}")
+    seen = pc[pc.RECORD_ID == rid]
+    print(f"  stage-1 candidates : {seen.REG_ID.nunique()}")
+    print(f"  decisions          : {seen.decision.value_counts().to_dict()}")
+
+
+# %% STAGE-1 DIAG 2
+rows = []
+for rid in no_link:
+    greg = gold_reg.get(rid, set())
+    seen = pc[pc.RECORD_ID == rid]
+    seen_regs = set(seen.REG_ID)
+    if not greg:
+        cls = "A. no golden regulation (unscorable)"
+    elif rid not in set(pc.RECORD_ID):
+        cls = "B. record never processed by stage 1"
+    elif greg & seen_regs:
+        # golden reg WAS a candidate — so the judge saw it and didn't link it
+        dec = seen.loc[seen.REG_ID.isin(greg), "decision"].value_counts().to_dict()
+        cls = f"C. judge miss (saw golden reg, said {dec})"
+    else:
+        cls = "D. retrieval miss (golden reg never shortlisted)"
+    rows.append({"RECORD_ID": rid, "n_golden_regs": len(greg),
+                 "n_candidates": seen.REG_ID.nunique(), "class": cls})
+s1 = pd.DataFrame(rows)
+print(s1["class"].apply(lambda x: x.split("(")[0].strip()).value_counts().to_string())
+print()
+print(s1.to_string(index=False))
+
+
+# %% STAGE-1 DIAG 3
+retr = s1.loc[s1["class"].str.startswith("D"), "RECORD_ID"].tolist()
+print(f"retrieval-miss records: {len(retr)}")
+
+# what regulations did stage 1 have available? — the reg corpus it embedded.
+# adjust `regs` to whatever stage 1 called its regulation table.
+try:
+    corpus = set(regs.REG_ID.astype(str).str.strip())      # stage-1 reg corpus
+except NameError:
+    corpus = set(e2p.REG_ID.dropna())                      # fallback: RegMap regs
+    print("[note] using RegMap E2 regs as corpus proxy")
+
+for rid in retr:
+    greg = gold_reg.get(rid, set())
+    in_corpus = greg & corpus
+    print(f"  {rid}: golden={sorted(greg)}  in stage-1 corpus: {sorted(in_corpus)}"
+          f"  {'<- was available, cosine missed it' if in_corpus else '<- not in corpus at all'}")
+
+
 
