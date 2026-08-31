@@ -1,0 +1,52 @@
+# %% DIAG 1 — why the 42 produced nothing
+gold_recs = set(gold.RECORD_ID)
+empty = sorted(gold_recs - set(pred.RECORD_ID))
+print(f"empty records: {len(empty)}")
+
+pc = pairs.copy(); pc["RECORD_ID"] = pc.RECORD_ID.astype(str).str.strip()
+rows = []
+for rid in empty:
+    inp   = rid in set(pc.RECORD_ID)
+    errd  = rid in err_records
+    linked_here = pc[(pc.RECORD_ID == rid) & (pc.decision == "LINKED")]
+    n_linked = linked_here.REG_ID.nunique()
+    asr = a_sum[a_sum.RECORD_ID == rid]
+    n_sum = asr.SUM_ID.nunique()
+    has_text = asr.alert_text.notna().any() if len(asr) else False
+    n_judg = len(verdicts[verdicts.RECORD_ID == rid]) if len(verdicts) else 0
+    n_acc  = len(accepted[accepted.RECORD_ID == rid]) if len(accepted) else 0
+    if not inp:        cause = "1. not in pairs at all"
+    elif errd:         cause = "2. dropped as stage-1 error"
+    elif n_linked==0:  cause = "3. no LINKED regulation"
+    elif n_sum==0:     cause = "4. linked reg has no published summary"
+    elif not has_text: cause = "5. alert_text missing"
+    elif n_judg and n_acc==0: cause = "6. all candidate risks rejected by judge"
+    else:              cause = "7. other — inspect"
+    rows.append({"RECORD_ID": rid, "linked_regs": n_linked, "summaries": n_sum,
+                 "judged": n_judg, "accepted": n_acc, "cause": cause})
+diag = pd.DataFrame(rows)
+print(diag.cause.value_counts().to_string())
+print()
+print(diag.to_string(index=False))
+
+
+# %% DIAG 2 — records that predicted but matched nothing
+pr = per_record[per_record.level == "l1_library_control"]
+zero = pr[(pr.recall == 0) & (pr.n_pred > 0)].RECORD_ID.tolist()
+print(f"zero-overlap records: {len(zero)}  {zero}")
+
+for rid in zero[:6]:
+    gc_ = sets_for(gold, rid, "L1_LIB_CTRL")
+    pc_ = sets_for(pred, rid, "L1_LIB_CTRL")
+    gr  = sets_for(gold, rid, "REG_ID") if "REG_ID" in gold.columns else set()
+    pr_ = set(pairs_clean.loc[(pairs_clean.RECORD_ID==rid) &
+                              (pairs_clean.decision=="LINKED"), "REG_ID"].astype(str).str.strip())
+    print(f"\n--- {rid} ---")
+    print(f"  golden REG_IDs   : {sorted(gr)}")
+    print(f"  Lane A LINKED regs: {sorted(pr_)}")
+    print(f"  reg overlap       : {gr & pr_}")
+    print(f"  golden controls   : {sorted(gc_)[:8]}")
+    print(f"  laneA  controls   : {sorted(pc_)[:8]}")
+    print(f"  format sample gold={list(gc_)[:2]}  pred={list(pc_)[:2]}")
+
+
