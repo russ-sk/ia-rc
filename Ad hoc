@@ -252,3 +252,95 @@ def read_regmap(n):
 def read_helios(stem, usecols=None):
     return _read_any(_find(HELIOS_DIR, stem), columns=usecols)
 
+# %% A12. Precision / recall — ALL golden records (empties = recall 0) ---------
+pred = laneA_exploded.copy(); pred["RECORD_ID"] = pred.RECORD_ID.astype(str).str.strip()
+
+ALL_GOLD = sorted(set(gold.RECORD_ID))                       # every golden record
+SCORED   = sorted(set(pred.RECORD_ID) & set(gold.RECORD_ID)) # Lane A produced something
+EMPTY    = sorted(set(gold.RECORD_ID) - set(pred.RECORD_ID)) # Lane A produced nothing
+print(f"golden records total : {len(ALL_GOLD)}")
+print(f"  scored (nonempty)  : {len(SCORED)}")
+print(f"  empty (recall 0)   : {len(EMPTY)}")
+
+def sets_for(df, rid, col):
+    if col not in df.columns: return set()
+    s = df.loc[df.RECORD_ID.astype(str).str.strip() == rid, col]
+    return {x for x in s.dropna().astype(str).str.strip() if x.lower() not in PLACEHOLDER}
+
+def score(p, g):
+    tp, fp, fn = len(p & g), len(p - g), len(g - p)
+    pr  = tp/(tp+fp) if (tp+fp) else np.nan
+    rc_ = tp/(tp+fn) if (tp+fn) else np.nan
+    f1  = 2*pr*rc_/(pr+rc_) if (pr and rc_ and pr+rc_) else np.nan
+    jac = tp/(tp+fp+fn) if (tp+fp+fn) else np.nan
+    return tp, fp, fn, pr, rc_, f1, jac
+
+LEVELS = [("library_risk","LIB_RISK_ID","LIB_RISK_ID"),
+          ("l1_library_control","L1_LIB_CTRL","L1_LIB_CTRL"),
+          ("l1_control_instance","L1_CTRL","l1_control_id")]
+
+# --- stage-1 ceiling: which golden ids were even reachable via the linked regs ---
+reach = (a_sum[["RECORD_ID","REG_ID","SUM_ID"]].drop_duplicates()
+         .merge(rr, on=["REG_ID","SUM_ID"], how="left")
+         .merge(rc, on=["REG_ID","SUM_ID","LIB_RISK_ID"], how="left"))
+reach["RECORD_ID"] = reach.RECORD_ID.astype(str).str.strip()
+def reach_set(rid, col):
+    c = {"LIB_RISK_ID":"LIB_RISK_ID","L1_LIB_CTRL":"L1_LIB_CTRL"}.get(col)
+    if c is None or c not in reach.columns: return set()
+    s = reach.loc[reach.RECORD_ID == rid, c]
+    return {x for x in s.dropna().astype(str).str.strip() if x.lower() not in PLACEHOLDER}
+
+micro_all, micro_scored, macro, decomp = [], [], [], []
+for level, gcol, pcol in LEVELS:
+    aA_p, aA_g, aS_p, aS_g = set(), set(), set(), set()
+    ceil_tp = ceil_all = cond_tp = 0
+    for rid in ALL_GOLD:
+        g  = sets_for(gold, rid, gcol)
+        p  = sets_for(pred, rid, pcol)          # empty for the 42
+        aA_p |= {(rid,x) for x in p}; aA_g |= {(rid,x) for x in g}
+        if rid in set(pred.RECORD_ID):
+            aS_p |= {(rid,x) for x in p}; aS_g |= {(rid,x) for x in g}
+        tp,fp,fn,pr,rc_,f1,jac = score(p,g)
+        macro.append(dict(level=level, RECORD_ID=rid, precision=pr,
+                          recall=(rc_ if not np.isnan(rc_) else np.nan),
+                          recall0=(rc_ if not np.isnan(rc_) else (0.0 if g else np.nan)),
+                          n_gold=len(g), n_pred=len(p), empty=(rid in EMPTY)))
+        # ceiling decomposition (risk & control levels only)
+        if level != "l1_control_instance":
+            rch = reach_set(rid, gcol)
+            ceil_tp += len(g & rch); ceil_all += len(g); cond_tp += len(p & g)
+    tp,fp,fn,pr,rc_,f1,jac = score(aA_p, aA_g)
+    micro_all.append(dict(level=level, tp=tp, fp=fp, fn=fn, precision=pr, recall=rc_, f1=f1))
+    tp,fp,fn,pr,rc_,f1,jac = score(aS_p, aS_g)
+    micro_scored.append(dict(level=level, precision=pr, recall=rc_, f1=f1))
+    if level != "l1_control_instance":
+        decomp.append(dict(level=level, golden=ceil_all,
+                           reachable=ceil_tp, ceiling=ceil_tp/ceil_all if ceil_all else np.nan,
+                           returned=cond_tp,
+                           end_to_end=cond_tp/ceil_all if ceil_all else np.nan,
+                           conversion=cond_tp/ceil_tp if ceil_tp else np.nan))
+
+per_record = pd.DataFrame(macro)
+
+print("\n==== MICRO — ALL golden records (empties counted, recall 0) ====")
+print(pd.DataFrame(micro_all).to_string(index=False, float_format=lambda x:f"{x:.3f}"))
+print("\n==== MICRO — scored records only (Lane-A-conditional) ====")
+print(pd.DataFrame(micro_scored).to_string(index=False, float_format=lambda x:f"{x:.3f}"))
+
+print("\n==== MACRO — per-record mean, empties as recall 0 ====")
+print(per_record.groupby("level").agg(
+        precision=("precision","mean"),
+        recall_scored=("recall","mean"),          # NaN-skipping = scored only
+        recall_all=("recall0","mean")             # empties folded in as 0
+     ).to_string(float_format=lambda x:f"{x:.3f}"))
+
+print("\n==== RECALL DECOMPOSITION (where the loss is) ====")
+print(pd.DataFrame(decomp).to_string(index=False, float_format=lambda x:f"{x:.3f}"))
+print("\n  ceiling    = fraction of golden reachable via the regulations stage 1 linked")
+print("  conversion = of what was reachable, how much Lane A returned")
+print("  end_to_end = ceiling x conversion  (the ALL-records recall)")
+
+pd.DataFrame(micro_all).to_csv(OUTP/"laneA_eval_micro_all.csv", index=False)
+per_record.to_csv(OUTP/"laneA_eval_per_record_all.csv", index=False)
+
+
