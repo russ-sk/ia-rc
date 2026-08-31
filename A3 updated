@@ -59,3 +59,96 @@ print(f"  instance description populated      : {hinst_text.instance_description
 print(f"  RegMap controls with library text   : "
       f"{len(set(e3p.L1_LIB_CTRL.dropna()) & set(hcontrols.L1_LIB_CTRL))}"
       f" / {e3p.L1_LIB_CTRL.nunique()}")
+
+# %% A11. Explode ------------------------------------------------------------
+from pathlib import Path
+OUTP = Path(OUT) if isinstance(OUT, str) else OUT
+OUTP.mkdir(parents=True, exist_ok=True)
+
+def _col(df, name):
+    """Column as a string Series, or empty strings if the column isn't there."""
+    return (df[name].fillna("").astype(str) if name in df.columns
+            else pd.Series("", index=df.index))
+
+# risk -> control links, keeping the null-control row only when the risk has no
+# real control at all (so control-less risks survive without spawning phantom rows)
+links = both[["RECORD_ID", "LIB_RISK_ID", "L1_LIB_CTRL",
+              "REG_ID", "SUM_ID"]].drop_duplicates()
+links["has_ctrl"] = links.L1_LIB_CTRL.notna()
+keep = links.groupby(["RECORD_ID", "LIB_RISK_ID"]).has_ctrl.transform("any")
+links = links[links.has_ctrl | ~keep].drop(columns="has_ctrl")
+
+laneA_exploded = (risk_grain
+    .merge(links,      on=["RECORD_ID", "LIB_RISK_ID"], how="left")
+    .merge(hcontrols,  on="L1_LIB_CTRL", how="left")
+    .merge(ri,         on=["REG_ID", "SUM_ID", "LIB_RISK_ID", "L1_LIB_CTRL"], how="left")
+    .merge(hinst_text, on=["L1_LIB_CTRL", "l1_control_id"], how="left"))
+
+laneA_exploded["has_control"]  = laneA_exploded.L1_LIB_CTRL.notna()
+laneA_exploded["has_instance"] = (laneA_exploded.l1_control_id.notna()
+                                  if "l1_control_id" in laneA_exploded.columns else False)
+
+laneA_exploded["retired_flag"] = (
+    _col(laneA_exploded, "control_title").str.contains("RETIRE", case=False)
+    | _col(laneA_exploded, "instance_title").str.contains("RETIRE", case=False)
+    | _col(laneA_exploded, "instance_status").str.contains("RETIRE", case=False))
+
+laneA_exploded["inactive_flag"] = (
+    _col(laneA_exploded, "is_active").str.strip().str.lower()
+    .isin({"false", "f", "n", "no", "0"}))
+
+laneA_exploded["source"] = "regmap_laneA"
+
+COLS = ["RECORD_ID", "LIB_RISK_ID", "risk_title",
+        "L1_LIB_CTRL", "control_title",
+        "l1_control_id", "instance_title", "is_active", "instance_status",
+        "has_control", "has_instance", "retired_flag", "inactive_flag",
+        "branch", "decisions", "confidence", "risk_score", "max_link_score",
+        "via_regulations", "via_summaries", "via_approaches",
+        "risk_description", "control_description", "instance_description",
+        "reasoning", "source"]
+laneA_exploded = laneA_exploded[[c for c in COLS if c in laneA_exploded.columns]]
+laneA_exploded = laneA_exploded.sort_values(
+    [c for c in ["RECORD_ID", "confidence", "LIB_RISK_ID", "L1_LIB_CTRL", "l1_control_id"]
+     if c in laneA_exploded.columns])
+
+laneA_risks = (laneA_exploded.groupby(["RECORD_ID", "LIB_RISK_ID"])
+    .agg(risk_title  = ("risk_title", "first"),
+         branch      = ("branch", "first"),
+         confidence  = ("confidence", "first"),
+         n_controls  = ("L1_LIB_CTRL", "nunique"),
+         n_instances = ("l1_control_id", "nunique")).reset_index())
+
+# ---- CHECK ----
+print("A11 CHECK")
+print(f"  exploded rows: {len(laneA_exploded):,}")
+print("\nper record:")
+print(laneA_exploded.groupby("RECORD_ID").agg(
+        library_risks    = ("LIB_RISK_ID", "nunique"),
+        library_controls = ("L1_LIB_CTRL", "nunique"),
+        instances        = ("l1_control_id", "nunique"),
+        rows             = ("LIB_RISK_ID", "size")).to_string())
+
+print(f"\n  risks with NO control     : {(laneA_risks.n_controls == 0).sum()} "
+      f"of {len(laneA_risks)}")
+print(f"  controls with no text     : "
+      f"{laneA_exploded.loc[laneA_exploded.has_control & laneA_exploded.control_title.isna(), 'L1_LIB_CTRL'].nunique()}")
+print(f"  controls with no instance : "
+      f"{laneA_exploded.loc[laneA_exploded.has_control & ~laneA_exploded.has_instance, 'L1_LIB_CTRL'].nunique()}")
+print(f"  controls flagged retired  : "
+      f"{laneA_exploded.loc[laneA_exploded.retired_flag, 'L1_LIB_CTRL'].nunique()}")
+print(f"  instances flagged inactive: "
+      f"{laneA_exploded.loc[laneA_exploded.inactive_flag, 'l1_control_id'].nunique()}")
+print(f"\n  confidence: {laneA_exploded.confidence.value_counts().to_dict()}")
+
+print("\nsample:")
+print(laneA_exploded.head(8)[[c for c in
+      ["RECORD_ID","LIB_RISK_ID","L1_LIB_CTRL","l1_control_id","confidence","branch"]
+      if c in laneA_exploded.columns]].to_string(index=False))
+
+laneA_exploded.to_parquet(OUTP / "laneA_exploded.parquet", index=False)
+laneA_risks.to_parquet(OUTP / "laneA_risks.parquet", index=False)
+final.to_parquet(OUTP / "laneA_control_recommendations.parquet", index=False)
+laneA_exploded.to_excel(OUTP / "laneA_exploded.xlsx", index=False)
+print(f"\nsaved -> {OUTP}")
+
