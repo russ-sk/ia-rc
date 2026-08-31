@@ -1,0 +1,109 @@
+# %% D1
+keysets, mapped_sets, rows = {}, {}, []
+for _, r in gc_raw.iterrows():
+    d   = parse_rc(r[G_DICT])
+    rid = str(r[G_RECORD]).strip()
+    keys   = {_id(k) for k in d} - {None}
+    mapped = {_id(k) for k, v in d.items() if isinstance(v, dict) and v} - {None}
+    keysets.setdefault(rid, set()).update(keys)
+    mapped_sets.setdefault(rid, set()).update(mapped)
+
+for rid in sorted(keysets):
+    rows.append({"RECORD_ID": rid, "risk_keys": len(keysets[rid]),
+                 "mapped_to_controls": len(mapped_sets[rid]),
+                 "None_valued": len(keysets[rid] - mapped_sets[rid])})
+d1 = pd.DataFrame(rows)
+print(d1.head(20).to_string(index=False))
+print(f"\nrecords: {len(keysets)}")
+print(f"distinct risk-key SETS      : {len({frozenset(s) for s in keysets.values()})}")
+print(f"distinct MAPPED sets        : {len({frozenset(s) for s in mapped_sets.values()})}")
+print(f"intersection of key sets    : {len(set.intersection(*keysets.values()))}")
+print(f"union of key sets           : {len(set.union(*keysets.values()))}")
+print("\n-> 1 distinct key set but many distinct mapped sets = the keys are an "
+      "enumeration and only the mapped ones are real positives")
+
+
+# %% D2
+for rid in RECORDS:
+    k, m = keysets.get(rid, set()), mapped_sets.get(rid, set())
+    p = sets_for(pred, rid, "LIB_RISK_ID")
+    print(f"\n--- {rid} ---")
+    print(f"  golden risk keys          : {len(k)}")
+    print(f"  golden risks WITH controls: {len(m)}   {sorted(m)}")
+    print(f"  golden risks None-valued  : {len(k - m)}")
+    print(f"  Lane A returned           : {len(p)}")
+    print(f"  Lane A ∩ mapped           : {len(p & m)}")
+    print(f"  Lane A ∩ None-valued      : {len(p & (k - m))}")
+    print(f"  Lane A not in golden at all: {sorted(p - k)}")
+
+# %% D3
+rows = []
+for rid in RECORDS:
+    p = sets_for(pred, rid, "LIB_RISK_ID")
+    for label, g in [("all keys (current)", keysets.get(rid, set())),
+                     ("mapped only",        mapped_sets.get(rid, set()))]:
+        tp, fp, fn, pr, rc_, f1, jac = score(p, g)
+        rows.append(dict(RECORD_ID=rid, denominator=label, n_gold=len(g), n_laneA=len(p),
+                         matched=tp, extra=fp, missed=fn, precision=pr, recall=rc_, f1=f1))
+print(pd.DataFrame(rows).to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+
+# %% D4
+reach = (a_sum[["RECORD_ID", "REG_ID", "SUM_ID"]].drop_duplicates()
+         .merge(rr, on=["REG_ID", "SUM_ID"], how="inner"))
+reach["RECORD_ID"] = reach.RECORD_ID.astype(str).str.strip()
+
+for rid in RECORDS:
+    g  = keysets.get(rid, set())
+    m  = mapped_sets.get(rid, set())
+    p  = sets_for(pred, rid, "LIB_RISK_ID")
+    rch = set(reach.loc[reach.RECORD_ID == rid, "LIB_RISK_ID"])
+    miss = g - p
+    print(f"\n--- {rid} ---  missed={len(miss)}")
+    print(f"  reachable from the linked regulations : {len(miss & rch)}")
+    print(f"  NOT reachable (stage-1 ceiling)       : {len(miss - rch)}")
+    print(f"  of the MAPPED misses ({len(m - p)}), reachable: {len((m - p) & rch)}")
+    print(f"  reachable-but-missed: {sorted(miss & rch)[:20]}")
+
+
+# %% D5
+for rid in RECORDS:
+    g   = keysets.get(rid, set())
+    p   = sets_for(pred, rid, "LIB_RISK_ID")
+    rch = set(reach.loc[reach.RECORD_ID == rid, "LIB_RISK_ID"])
+    lost = sorted((g - p) & rch)
+    if not lost:
+        print(f"\n--- {rid} --- nothing reachable was dropped")
+        continue
+    br  = a_sum.loc[a_sum.RECORD_ID == rid, ["SUM_ID", "branch"]].drop_duplicates()
+    src = (reach[reach.RECORD_ID == rid][["SUM_ID", "LIB_RISK_ID"]]
+           .merge(br, on="SUM_ID", how="left"))
+    cnd = set(cand.loc[cand.RECORD_ID == rid, "LIB_RISK_ID"]) if len(cand) else set()
+    vd  = (verdicts[verdicts.RECORD_ID == rid].set_index("LIB_RISK_ID")
+           if len(verdicts) else pd.DataFrame())
+    print(f"\n--- {rid} --- {len(lost)} reachable but not returned")
+    for r in lost[:25]:
+        branches = sorted(set(src.loc[src.LIB_RISK_ID == r, "branch"].dropna()))
+        v = (vd.loc[r, "decision"] if len(vd) and r in vd.index else None)
+        s = (vd.loc[r, "risk_score"] if len(vd) and r in vd.index else None)
+        why = ("judged: " + str(v) + f" (score {s})" if v is not None
+               else "was a judged candidate but no verdict" if r in cnd
+               else "never became a candidate")
+        print(f"   {r}  branch={branches}  {why}")
+
+
+# %% D6
+gr = gold[gold.RECORD_ID.isin(RECORDS)]
+per_risk = (gr.groupby(["RECORD_ID", "LIB_RISK_ID"])
+              .L1_LIB_CTRL.nunique().rename("n_golden_controls").reset_index())
+per_risk["found_by_laneA"] = [
+    r.LIB_RISK_ID in sets_for(pred, r.RECORD_ID, "LIB_RISK_ID")
+    for r in per_risk.itertuples()]
+
+print(per_risk.groupby(["RECORD_ID", "found_by_laneA"])
+      .agg(risks=("LIB_RISK_ID", "nunique"),
+           total_golden_controls=("n_golden_controls", "sum"),
+           mean_controls_per_risk=("n_golden_controls", "mean")).to_string())
+print("\n-> if the risks Lane A MISSED carry ~0 golden controls, they are the "
+      "None-valued keys and the denominator is wrong, not the pipeline")
+
