@@ -1,0 +1,196 @@
+# %% A1. Config + helpers -----------------------------------------------------
+import re, json, time, asyncio
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from tqdm.auto import tqdm
+
+pd.set_option("display.width", 220); pd.set_option("display.max_columns", 60)
+
+REGMAP_DIR = Path(DATA) / "REGMAP"
+HELIOS_DIR = Path(DATA) / "Helios"
+OUTP       = Path(OUT) if isinstance(OUT, str) else OUT
+OUTP.mkdir(parents=True, exist_ok=True)
+
+STATUS_KEEP       = "published"
+DIRECT_APPROACHES = {"Detailed", "Enhanced"}
+UNKNOWN_APPROACH  = "judged"
+KEEP_RECORDS      = None            # None = every record in `pairs`
+
+LANE_HP = {"top_k": 200, "max_tokens": 6000, "concurrency": 10,
+           "max_retries": 3, "min_score": 5}
+PLACEHOLDER = {"nan", "none", "nat", "", "-", "null", "<na>"}
+
+C = {
+    "JUR": "Regulation Jurisdiction", "REG_ID": "Regulation ID",
+    "REG_STATUS": "Regulation Status", "REG_VER": "Regulation Version",
+    "SUM_ID": "Regulation Summary ID", "SUM_STATUS": "Regulation Summary Status",
+    "SUM_VER": "Regulation Summary Version",
+    "SUM_APPROACH": "Regulation Summary Control Mapping Approach",
+    "SUM_TITLE": "Regulation Summary Title", "SUM_TEXT": "Regulation Summary Detail Text",
+    "SUM_STEWARD": "Regulation Summary Risk Steward Area",
+    "SUM_TAX_L1": "Regulation Summary Risk Taxonomy L1",
+    "SUM_TAX_L2": "Regulation Summary Risk Taxonomy L2",
+    "SUM_TAX_L3": "Regulation Summary Risk Taxonomy L3",
+    "APPLIC_KEY": "Regulation Summary Applicability Unique Key",
+    "LIB_RISK_ID": "Regulation Summary Library Risk ID Number",
+    "L1_LIB_CTRL": "Regulation Summary L1 Library Control ID Number",
+    "RISK_ID": "Risk ID", "RISK_APPLIC": "Risk Instance Applicable?",
+    "L1_CTRL": "L1 Control ID", "L1_CTRL_APPL": "L1 Control Instance Applicable?",
+}
+SUMMARY_KEY       = ["JUR","REG_ID","REG_STATUS","REG_VER","SUM_ID","SUM_STATUS","SUM_VER"]
+APPLICABILITY_KEY = SUMMARY_KEY + ["SUM_TAX_L1","SUM_TAX_L2","SUM_TAX_L3","APPLIC_KEY"]
+
+def _k(s): return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+def resolve(df, label):
+    ex = [c for c in df.columns if _k(c) == _k(label)]
+    if ex: return ex[0]
+    lo = [c for c in df.columns if _k(label) in _k(c)]
+    if len(lo) == 1: return lo[0]
+    raise KeyError(f"cannot resolve {label!r}\n  candidates: {lo or 'none'}\n  in: {list(df.columns)}")
+
+def standardise(df, shorts):
+    return df.rename(columns={resolve(df, C[s]): s for s in shorts})[shorts].copy()
+
+def strip_ids(df, cols):
+    for c in cols:
+        if c in df.columns:
+            s = df[c].astype(str).str.strip()
+            df[c] = s.where(~s.str.lower().isin(PLACEHOLDER), np.nan)
+    return df
+
+def norm_approach(s):
+    a = s.astype(str).str.strip().str.title()
+    return a.where(~a.str.lower().isin(PLACEHOLDER), np.nan)
+
+def published(df):
+    n = len(df)
+    for c in ("REG_STATUS", "SUM_STATUS"):
+        if c in df.columns:
+            df = df[df[c].astype(str).str.strip().str.casefold() == STATUS_KEEP]
+    if n and not len(df): raise ValueError(f"published filter emptied — check {STATUS_KEEP!r}")
+    return df.reset_index(drop=True)
+
+def _find(directory, stem):
+    hits = [p for p in Path(directory).iterdir()
+            if p.suffix.lower() in {".xlsx",".xls",".csv",".parquet"}
+            and stem.lower() in p.name.lower()]
+    if not hits:
+        raise FileNotFoundError(f"no {stem!r} in {directory}: "
+                                f"{[p.name for p in Path(directory).iterdir()]}")
+    return sorted(hits)[0]
+
+def read_regmap(n):
+    p = _find(REGMAP_DIR, f"extract_{n}") if any(f"extract_{n}" in x.name.lower()
+              for x in REGMAP_DIR.iterdir()) else None
+    # tolerant match: "extract 2", "extract_2", "Extract2"
+    if p is None:
+        hits = [x for x in REGMAP_DIR.iterdir()
+                if x.suffix.lower() in {".xlsx",".xls",".csv",".parquet"}
+                and re.search(rf"extract\s*_?{n}\b", x.name, flags=re.I)]
+        p = sorted(hits)[0]
+    df = (pd.read_parquet(p) if p.suffix.lower()==".parquet" else
+          pd.read_csv(p, dtype=str) if p.suffix.lower()==".csv" else
+          pd.read_excel(p, dtype=str))
+    df.columns = [str(c).strip() for c in df.columns]
+    print(f"[load] {p.name}: rows={len(df):,} cols={len(df.columns)}")
+    return df
+
+def read_helios(stem, usecols=None):
+    """Read only `usecols` if given — avoids pyarrow choking on BigQuery 'dbdate' cols."""
+    p = _find(HELIOS_DIR, stem)
+    if p.suffix.lower() == ".parquet":
+        import pyarrow.parquet as pq
+        avail = set(pq.ParquetFile(p).schema.names)
+        cols  = [c for c in usecols if c in avail] if usecols else None
+        df = pd.read_parquet(p, columns=cols)
+    else:
+        df = (pd.read_csv(p, dtype=str) if p.suffix.lower()==".csv"
+              else pd.read_excel(p, dtype=str))
+        if usecols:
+            df = df[[c for c in usecols if c in df.columns]]
+    df.columns = [str(c).strip() for c in df.columns]
+    print(f"[load] {p.name}: rows={len(df):,} cols={len(df.columns)}")
+    return df
+
+def joinset(s): return " | ".join(sorted({str(x) for x in s if pd.notna(x)}))
+
+print("A1 CHECK  regmap:", REGMAP_DIR.exists(), " helios:", HELIOS_DIR.exists())
+
+
+# %% A3. Helios ---------------------------------------------------------------
+hrisk_raw = read_helios("risk", usecols=[
+    "library_risk_id", "library_risk_title", "library_risk_description",
+    "risk_status", "name"])
+
+l1_raw = read_helios("L1_Control", usecols=[
+    "l1_library_control_id", "l1_control_library_id",
+    "l1_library_control_title", "l1_control_library_title",
+    "l1_library_control_desc", "l1_library_control_description",
+    "l1_control_library_description",
+    "name", "l1_control_title_alias", "title", "description",
+    "is_active", "l1_control_status", "status"])
+
+rtcl = read_helios("rtcl", usecols=[
+    "l1_control_library_id", "l1_control_library_title", "l1_control_library_description"])
+
+hrisks = (hrisk_raw[["library_risk_id","library_risk_title","library_risk_description","risk_status"]]
+          .dropna(subset=["library_risk_id"]).drop_duplicates("library_risk_id")
+          .rename(columns={"library_risk_id":"LIB_RISK_ID","library_risk_title":"risk_title",
+                           "library_risk_description":"risk_description"}))
+hrisks["LIB_RISK_ID"] = hrisks.LIB_RISK_ID.astype(str).str.strip()
+hrisks["risk_text"] = (hrisks.risk_title.fillna("")+". "+hrisks.risk_description.fillna("")).map(clean)
+
+def pick(df,*cands,required=True):
+    for lab in cands:
+        ex=[c for c in df.columns if _k(c)==_k(lab)]
+        if ex: return ex[0]
+    for lab in cands:
+        lo=[c for c in df.columns if _k(lab) in _k(c) or _k(c) in _k(lab)]
+        if len(lo)==1: return lo[0]
+    if required: raise KeyError(f"none of {cands} in {list(df.columns)}")
+    return None
+
+L1_LIB_ID=pick(l1_raw,"l1_library_control_id","l1_control_library_id")
+L1_LIB_TITLE=pick(l1_raw,"l1_library_control_title","l1_control_library_title")
+L1_LIB_DESC=pick(l1_raw,"l1_library_control_desc","l1_library_control_description","l1_control_library_description",required=False)
+L1_NAME=pick(l1_raw,"name"); L1_ALIAS=pick(l1_raw,"l1_control_title_alias","title",required=False)
+L1_DESC=pick(l1_raw,"description",required=False); L1_ACTIVE=pick(l1_raw,"is_active",required=False)
+L1_STATUS=pick(l1_raw,"l1_control_status","status",required=False)
+
+hcontrols=(l1_raw[[c for c in [L1_LIB_ID,L1_LIB_TITLE,L1_LIB_DESC] if c]]
+           .dropna(subset=[L1_LIB_ID]).drop_duplicates(L1_LIB_ID)
+           .rename(columns={L1_LIB_ID:"L1_LIB_CTRL",L1_LIB_TITLE:"control_title",
+                            **({L1_LIB_DESC:"control_description"} if L1_LIB_DESC else {})}))
+if "control_description" not in hcontrols.columns: hcontrols["control_description"]=np.nan
+hcontrols["L1_LIB_CTRL"]=hcontrols.L1_LIB_CTRL.astype(str).str.strip()
+
+_rt=(rtcl[["l1_control_library_id","l1_control_library_title","l1_control_library_description"]]
+     .dropna(subset=["l1_control_library_id"]).drop_duplicates("l1_control_library_id")
+     .rename(columns={"l1_control_library_id":"L1_LIB_CTRL","l1_control_library_title":"control_title",
+                      "l1_control_library_description":"control_description"}))
+_rt["L1_LIB_CTRL"]=_rt.L1_LIB_CTRL.astype(str).str.strip()
+_gap=_rt[~_rt.L1_LIB_CTRL.isin(set(hcontrols.L1_LIB_CTRL))]
+hcontrols=pd.concat([hcontrols,_gap],ignore_index=True)
+
+ren={L1_LIB_ID:"L1_LIB_CTRL",L1_NAME:"l1_control_id"}
+if L1_ALIAS: ren[L1_ALIAS]="instance_title"
+if L1_DESC: ren[L1_DESC]="instance_description"
+if L1_ACTIVE: ren[L1_ACTIVE]="is_active"
+if L1_STATUS: ren[L1_STATUS]="instance_status"
+hinst_text=(l1_raw[list(ren)].dropna(subset=[L1_LIB_ID,L1_NAME]).drop_duplicates().rename(columns=ren))
+for c in ["L1_LIB_CTRL","l1_control_id"]: hinst_text[c]=hinst_text[c].astype(str).str.strip()
+
+r2lr=(hrisk_raw[["name","library_risk_id"]].dropna().drop_duplicates()
+      .rename(columns={"name":"RISK_ID","library_risk_id":"LIB_RISK_ID"}))
+c2lc=(l1_raw[[L1_NAME,L1_LIB_ID]].dropna().drop_duplicates()
+      .rename(columns={L1_NAME:"L1_CTRL",L1_LIB_ID:"L1_LIB_CTRL"}))
+for d in (r2lr,c2lc):
+    for c in d.columns: d[c]=d[c].astype(str).str.strip()
+
+print("A3 CHECK")
+print(f"  library risks={len(hrisks):,}  controls with text={len(hcontrols):,} "
+      f"(rtcl fill={len(_gap):,})  instance rows={len(hinst_text):,}")
+print(f"  RegMap ctrls with text: {len(set(e3p.L1_LIB_CTRL.dropna()) & set(hcontrols.L1_LIB_CTRL))}"
+      f" / {e3p.L1_LIB_CTRL.nunique()}")
