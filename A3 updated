@@ -1,0 +1,61 @@
+# %% A3 (control text block) — both grains from US_L1_Control
+L1_LIB_ID    = "l1_library_control_id"      # L1C-
+L1_LIB_TITLE = "l1_library_control_title"
+L1_LIB_DESC  = "l1_library_control_desc"
+L1_NAME      = "name"                       # 1C-  (instance)
+L1_ALIAS     = "l1_control_title_alias"
+L1_DESC      = "description"
+L1_ACTIVE    = "is_active"
+L1_STATUS    = "l1_control_status"
+
+# --- library grain: L1C- title + description ---
+hcontrols = (l1_raw[[L1_LIB_ID, L1_LIB_TITLE, L1_LIB_DESC]]
+             .dropna(subset=[L1_LIB_ID]).drop_duplicates(L1_LIB_ID)
+             .rename(columns={L1_LIB_ID:    "L1_LIB_CTRL",
+                              L1_LIB_TITLE: "control_title",
+                              L1_LIB_DESC:  "control_description"}))
+hcontrols["L1_LIB_CTRL"] = hcontrols.L1_LIB_CTRL.astype(str).str.strip()
+
+# rtcl only fills library controls US_L1_Control has no row for (zero instances).
+# It can only add; it never overrides.
+_rt = (rtcl[["l1_control_library_id", "l1_control_library_title",
+             "l1_control_library_description"]]
+       .dropna(subset=["l1_control_library_id"]).drop_duplicates("l1_control_library_id")
+       .rename(columns={"l1_control_library_id":          "L1_LIB_CTRL",
+                        "l1_control_library_title":       "control_title",
+                        "l1_control_library_description": "control_description"}))
+_rt["L1_LIB_CTRL"] = _rt.L1_LIB_CTRL.astype(str).str.strip()
+_gap = _rt[~_rt.L1_LIB_CTRL.isin(set(hcontrols.L1_LIB_CTRL))]
+hcontrols = pd.concat([hcontrols, _gap], ignore_index=True)
+
+# --- instance grain: 1C- title + description + status ---
+inst_cols = [c for c in [L1_LIB_ID, L1_NAME, L1_ALIAS, L1_DESC, L1_ACTIVE, L1_STATUS]
+             if c in l1_raw.columns]
+hinst_text = (l1_raw[inst_cols].dropna(subset=[L1_LIB_ID, L1_NAME]).drop_duplicates()
+              .rename(columns={L1_LIB_ID: "L1_LIB_CTRL",
+                               L1_NAME:   "l1_control_id",
+                               L1_ALIAS:  "instance_title",
+                               L1_DESC:   "instance_description",
+                               L1_ACTIVE: "is_active",
+                               L1_STATUS: "instance_status"}))
+for c in ["L1_LIB_CTRL", "l1_control_id"]:
+    hinst_text[c] = hinst_text[c].astype(str).str.strip()
+
+# identity maps (unchanged)
+r2lr = (hrisk_raw[["name", "library_risk_id"]].dropna().drop_duplicates()
+        .rename(columns={"name": "RISK_ID", "library_risk_id": "LIB_RISK_ID"}))
+c2lc = (l1_raw[[L1_NAME, L1_LIB_ID]].dropna().drop_duplicates()
+        .rename(columns={L1_NAME: "L1_CTRL", L1_LIB_ID: "L1_LIB_CTRL"}))
+for d in (r2lr, c2lc):
+    for c in d.columns:
+        d[c] = d[c].astype(str).str.strip()
+
+print("A3 CHECK (controls)")
+print(f"  library controls from US_L1_Control : {len(hcontrols) - len(_gap):,}")
+print(f"  filled from rtcl (no instance rows) : {len(_gap):,}")
+print(f"  instance rows with text             : {len(hinst_text):,}")
+print(f"  instance title populated            : {hinst_text.instance_title.notna().mean():.1%}")
+print(f"  instance description populated      : {hinst_text.instance_description.notna().mean():.1%}")
+print(f"  RegMap controls with library text   : "
+      f"{len(set(e3p.L1_LIB_CTRL.dropna()) & set(hcontrols.L1_LIB_CTRL))}"
+      f" / {e3p.L1_LIB_CTRL.nunique()}")
