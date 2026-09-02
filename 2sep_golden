@@ -71,3 +71,77 @@ print(per_record_pct.to_string(index=False))
     print(f"  judge/instance-missed (fix here): {judge_missed:,} "
           f"({judge_missed/n_miss*100:.0f}%)  a parent linked, 1C not")
 
+# %% A13. Performance scorecard ------------------------------------------------
+def performance_scorecard(gold, pred, total_alerts=None):
+    gold = gold.copy(); gold["RECORD_ID"] = gold.RECORD_ID.astype(str).str.strip()
+    pred = pred.copy(); pred["RECORD_ID"] = pred.RECORD_ID.astype(str).str.strip()
+
+    LEVELS = [("Library Risk",       "LIB_RISK_ID", "LIB_RISK_ID"),
+              ("L1 Library Control", "L1_LIB_CTRL", "L1_LIB_CTRL"),
+              ("L1 Control",         "L1_CTRL",     "l1_control_id")]
+
+    ALL_GOLD = sorted(set(gold.RECORD_ID))
+
+    rows = []
+    for level, gcol, pcol in LEVELS:
+        gpairs = {(rid, x) for rid in ALL_GOLD for x in sets_for(gold, rid, gcol)}
+        ppairs = {(rid, x) for rid in set(pred.RECORD_ID) for x in sets_for(pred, rid, pcol)}
+
+        validated = len(gpairs & ppairs)
+        missed    = len(gpairs - ppairs)
+        new       = len(ppairs - gpairs)
+        golden_n  = len(gpairs)
+        recall    = validated / golden_n if golden_n else np.nan
+
+        recs_gold = {r for r, _ in gpairs}
+        recs_hit  = {r for r, _ in (gpairs & ppairs)}
+        coverage  = f"{len(recs_hit)}/{len(recs_gold)}"
+
+        rows.append({"Level": level, "Golden links": golden_n,
+                     "Validated (TP)": validated, "Missed (FN)": missed,
+                     "Recall": f"{recall*100:.0f}%" if golden_n else "-",
+                     "New/Review": new, "Alert coverage": coverage})
+
+    scorecard = pd.DataFrame(rows)
+    print("=" * 90); print("A13 — LANE A PERFORMANCE SCORECARD"); print("=" * 90)
+    print(scorecard.to_string(index=False))
+
+    # ---- L1 Control miss decomposition at (record, 1C) grain ----
+    gt = gold[["RECORD_ID", "L1_LIB_CTRL", "L1_CTRL"]].copy()
+    for c in gt.columns:
+        gt[c] = gt[c].astype(str).str.strip()
+    gt = gt[~gt.L1_CTRL.str.lower().isin(PLACEHOLDER)
+            & ~gt.L1_LIB_CTRL.str.lower().isin(PLACEHOLDER)]
+
+    pred_inst    = {(r, i) for r, i in pred[["RECORD_ID", "l1_control_id"]].itertuples(index=False, name=None)
+                    if str(i).strip().lower() not in PLACEHOLDER}
+    pred_libctrl = {(r, c) for r, c in pred[["RECORD_ID", "L1_LIB_CTRL"]].itertuples(index=False, name=None)
+                    if str(c).strip().lower() not in PLACEHOLDER}
+
+    # per distinct (record, 1C): was ANY parent L1C predicted, and was the 1C itself missed?
+    inst = (gt.assign(parent_pred=[(r, c) in pred_libctrl
+                                   for r, c in zip(gt.RECORD_ID, gt.L1_LIB_CTRL)])
+              .groupby(["RECORD_ID", "L1_CTRL"])
+              .agg(any_parent_pred=("parent_pred", "any")).reset_index())
+    inst["missed"] = [(r, i) not in pred_inst
+                      for r, i in zip(inst.RECORD_ID, inst.L1_CTRL)]
+
+    missed = inst[inst.missed]
+    cascade_blocked = int((~missed.any_parent_pred).sum())   # no parent L1C linked
+    judge_missed    = int(missed.any_parent_pred.sum())      # a parent linked, 1C not
+    n_miss = max(len(missed), 1)
+
+    print("\n" + "-" * 90)
+    print("L1 CONTROL MISS DECOMPOSITION  (distinct record x 1C)")
+    print(f"  total missed 1C          : {len(missed):,}")
+    print(f"  cascade-blocked (fix upstream) : {cascade_blocked:,} "
+          f"({cascade_blocked/n_miss*100:.0f}%)  no parent L1C linked")
+    print(f"  judge/instance-missed (fix here): {judge_missed:,} "
+          f"({judge_missed/n_miss*100:.0f}%)  a parent linked, 1C not")
+
+    scorecard.to_csv(OUTP / "laneA_scorecard.csv", index=False)
+    return scorecard
+
+scorecard = performance_scorecard(gold, laneA_exploded)
+
+
