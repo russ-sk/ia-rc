@@ -38,3 +38,36 @@ per_record_pct["pct_blank_1c"] = (per_record_pct.n_blank_1c
 per_record_pct = per_record_pct.sort_values("pct_blank_1c", ascending=False)
 
 print(per_record_pct.to_string(index=False))
+
+    # ---- L1 Control miss decomposition at (record, 1C) grain ----
+    gt = gold[["RECORD_ID","L1_LIB_CTRL","L1_CTRL"]].copy()
+    for c in gt.columns: gt[c] = gt[c].astype(str).str.strip()
+    gt = gt[~gt.L1_CTRL.str.lower().isin(PLACEHOLDER)
+            & ~gt.L1_LIB_CTRL.str.lower().isin(PLACEHOLDER)]
+
+    pred_inst    = {(r,i) for r,i in pred[["RECORD_ID","l1_control_id"]].itertuples(index=False,name=None)
+                    if str(i).strip().lower() not in PLACEHOLDER}
+    pred_libctrl = {(r,c) for r,c in pred[["RECORD_ID","L1_LIB_CTRL"]].itertuples(index=False,name=None)
+                    if str(c).strip().lower() not in PLACEHOLDER}
+
+    # per distinct (record, 1C): is it missed, and was ANY parent L1C predicted?
+    inst = (gt.assign(parent_pred=[(r,c) in pred_libctrl
+                                   for r,c in zip(gt.RECORD_ID, gt.L1_LIB_CTRL)])
+              .groupby(["RECORD_ID","L1_CTRL"])
+              .agg(any_parent_pred=("parent_pred","any")).reset_index())
+    inst["missed"] = [(r,i) not in pred_inst
+                      for r,i in zip(inst.RECORD_ID, inst.L1_CTRL)]
+
+    missed = inst[inst.missed]
+    cascade_blocked = int((~missed.any_parent_pred).sum())   # no parent predicted
+    judge_missed    = int(missed.any_parent_pred.sum())      # a parent was predicted
+    n_miss = max(len(missed), 1)
+
+    print("\n" + "-"*90)
+    print("L1 CONTROL MISS DECOMPOSITION  (distinct record x 1C)")
+    print(f"  total missed 1C          : {len(missed):,}")
+    print(f"  cascade-blocked (fix upstream) : {cascade_blocked:,} "
+          f"({cascade_blocked/n_miss*100:.0f}%)  no parent L1C linked")
+    print(f"  judge/instance-missed (fix here): {judge_missed:,} "
+          f"({judge_missed/n_miss*100:.0f}%)  a parent linked, 1C not")
+
