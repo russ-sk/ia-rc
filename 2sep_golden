@@ -1,0 +1,40 @@
+REC      = "Record ID"
+LIB_CTRL = "Regulation Summary L1 Library Control ID Number"   # L1C-
+INST     = "L1 Control ID"                                     # 1C-
+BAD      = {"-", "", "nan", "none", "null", "nat"}
+
+g = golden.copy()
+for c in (LIB_CTRL, INST):
+    g[c] = g[c].astype(str).str.strip()
+
+gi = g[~g[INST].str.lower().isin(BAD)]     # rows with a real 1C-
+
+per_record_1c = (gi.groupby(REC)[INST].nunique()
+                   .sort_values(ascending=False)
+                   .rename("n_1c").reset_index())
+print(per_record_1c.to_string(index=False))
+print(f"\ntotal 1C linkages (sum over records): {per_record_1c.n_1c.sum():,}")
+print(f"distinct 1C overall                 : {gi[INST].nunique():,}")
+
+
+gl = g[~g[LIB_CTRL].str.lower().isin(BAD)].copy()
+gl["has_inst"] = ~gl[INST].str.lower().isin(BAD)
+
+by_lc = gl.groupby(LIB_CTRL).has_inst.any()     # does this L1C ever get a 1C?
+print(f"distinct L1C            : {by_lc.size:,}")
+print(f"L1C with blank 1C       : {(~by_lc).sum():,}")
+print(f"percentage blank        : {(~by_lc).mean()*100:.1f}%")
+
+
+by_rec_lc = gl.groupby([REC, LIB_CTRL]).has_inst.any().reset_index()
+
+per_record_pct = (by_rec_lc.groupby(REC)
+    .agg(n_l1c        = (LIB_CTRL, "nunique"),
+         n_with_1c    = ("has_inst", "sum"))
+    .reset_index())
+per_record_pct["n_blank_1c"]  = per_record_pct.n_l1c - per_record_pct.n_with_1c
+per_record_pct["pct_blank_1c"] = (per_record_pct.n_blank_1c
+                                  / per_record_pct.n_l1c * 100).round(1)
+per_record_pct = per_record_pct.sort_values("pct_blank_1c", ascending=False)
+
+print(per_record_pct.to_string(index=False))
