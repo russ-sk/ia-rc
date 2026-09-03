@@ -322,3 +322,59 @@ if len(verdicts):
     print(f"  full-scale distribution: "
           f"{verdicts[verdicts.ctrl_score>=0].ctrl_score.value_counts().sort_index().to_dict()}")
 
+# %% A9. Threshold-driven scorecard -------------------------------------------
+def _sets(df, rid, col):
+    if col not in df.columns: return set()
+    s = df.loc[df.RECORD_ID.astype(str).str.strip()==str(rid), col]
+    return {x for x in s.dropna().astype(str).str.strip() if x.lower() not in PLACEHOLDER}
+
+ALL_GOLD = sorted(set(gold.RECORD_ID.astype(str).str.strip()))
+GOLD_1C  = {r: _sets(gold, r, "L1_CTRL")     for r in ALL_GOLD}
+GOLD_L1C = {r: _sets(gold, r, "L1_LIB_CTRL") for r in ALL_GOLD}
+GTOT_1C  = {(r,x) for r,s in GOLD_1C.items()  for x in s}
+GTOT_L1C = {(r,x) for r,s in GOLD_L1C.items() for x in s}
+
+from collections import Counter
+def scorecard_at(threshold, show=True):
+    acc = verdicts[verdicts.ctrl_score >= threshold].copy()   # <-- threshold is the ONLY gate
+    acc["RECORD_ID"] = acc.RECORD_ID.astype(str).str.strip()
+    p = acc.merge(c2lc, on="L1_CTRL", how="left")
+    p1c  = {(r,c) for r,c in p[["RECORD_ID","L1_CTRL"]].itertuples(index=False,name=None)
+            if str(c).lower() not in PLACEHOLDER}
+    pl1c = {(r,c) for r,c in p.dropna(subset=["L1_LIB_CTRL"])[["RECORD_ID","L1_LIB_CTRL"]]
+                    .itertuples(index=False,name=None) if str(c).lower() not in PLACEHOLDER}
+    rows=[]
+    for level, pp, gtot in [("L1 Control", p1c, GTOT_1C),
+                            ("L1 Library Control", pl1c, GTOT_L1C)]:
+        val,miss,new = len(gtot&pp), len(gtot-pp), len(pp-gtot)
+        rg={r for r,_ in gtot}; rh={r for r,_ in (gtot&pp)}
+        per=Counter(r for r,_ in pp)
+        rows.append({"threshold":threshold,"level":level,"Golden":len(gtot),
+                     "Validated":val,"Missed":miss,
+                     "Recall":round(val/len(gtot),3) if gtot else np.nan,
+                     "New/Review":new,"Coverage":f"{len(rh)}/{len(rg)}",
+                     "median/alert":int(np.median(list(per.values()))) if per else 0,
+                     "max/alert":max(per.values()) if per else 0})
+    card=pd.DataFrame(rows)
+    if show:
+        print(f"\n=== scorecard @ threshold {threshold} ===")
+        print(card.to_string(index=False))
+    return card
+
+THRESHOLD = 7
+scorecard_at(THRESHOLD)
+
+
+# %% A10. Full sweep 0..10 ----------------------------------------------------
+from tqdm.auto import tqdm
+sweep = pd.concat([scorecard_at(t, show=False) for t in tqdm(range(0,11),
+                   desc="threshold sweep", unit="t")], ignore_index=True)
+
+for level in ["L1 Control","L1 Library Control"]:
+    print(f"\n{'='*72}\n{level}\n{'='*72}")
+    print(sweep[sweep.level==level]
+          [["threshold","Recall","Validated","Missed","New/Review","median/alert","max/alert"]]
+          .to_string(index=False))
+sweep.to_csv(OUTP/"laneA_v21_threshold_sweep.csv", index=False)
+
+
