@@ -31,3 +31,12 @@ print("\ntop RSMs by L1C count:")
 print(rsm_detail.head(10).to_string(index=False))
 print("\ntop L1C by instance count:")
 print(lc_detail.head(10).to_string(index=False))
+
+err_rows = verdicts[verdicts.ctrl_score < 0]
+print(f"errored candidates: {len(err_rows):,}  batches≈{len(err_rows)//50}")
+print(err_rows.reasoning.value_counts().head(3))
+# how many GOLDEN controls fell in an errored batch?
+err_pairs = {(str(r).strip(), str(c).strip())
+             for r,c in err_rows[["RECORD_ID","L1_CTRL"]].itertuples(index=False,name=None)}
+print("golden 1C lost to errors:", len(gold_1c & err_pairs))
+
