@@ -176,5 +176,54 @@ for level in ["L1 Control","L1 Library Control"]:
           .to_string(index=False))
 sweep.to_csv(OUTP/"laneA_v21_threshold_sweep.csv", index=False)
 
+# %% A10. Full sweep — precomputed golden, progress bar -----------------------
+from tqdm.auto import tqdm
+
+# build golden per-record sets ONCE (this was being redone on every call)
+GOLD_1C  = {r: _sets(gold, r, "L1_CTRL")     for r in ALL_GOLD}
+GOLD_L1C = {r: _sets(gold, r, "L1_LIB_CTRL") for r in ALL_GOLD}
+GTOT_1C  = {(r,x) for r,s in GOLD_1C.items()  for x in s}
+GTOT_L1C = {(r,x) for r,s in GOLD_L1C.items() for x in s}
+
+def scorecard_fast(threshold, decisions):
+    acc = verdicts[verdicts.decision.isin(decisions) & (verdicts.ctrl_score >= threshold)].copy()
+    acc["RECORD_ID"] = acc.RECORD_ID.astype(str).str.strip()
+    p = acc.merge(c2lc, on="L1_CTRL", how="left")
+
+    p1c  = {(r, c) for r, c in p[["RECORD_ID","L1_CTRL"]].itertuples(index=False, name=None)
+            if str(c).lower() not in PLACEHOLDER}
+    pl1c = {(r, c) for r, c in p.dropna(subset=["L1_LIB_CTRL"])[["RECORD_ID","L1_LIB_CTRL"]]
+                     .itertuples(index=False, name=None) if str(c).lower() not in PLACEHOLDER}
+
+    rows=[]
+    for level, pp, gtot in [("L1 Control", p1c, GTOT_1C),
+                            ("L1 Library Control", pl1c, GTOT_L1C)]:
+        val, miss, new = len(gtot & pp), len(gtot - pp), len(pp - gtot)
+        rg = {r for r,_ in gtot}; rh = {r for r,_ in (gtot & pp)}
+        from collections import Counter
+        per = Counter(r for r,_ in pp)
+        med = int(np.median(list(per.values()))) if per else 0
+        mx  = max(per.values()) if per else 0
+        rows.append({"threshold":threshold,"decisions":"+".join(sorted(decisions)),
+                     "level":level,"Golden":len(gtot),"Validated":val,"Missed":miss,
+                     "Recall":round(val/len(gtot),3) if gtot else np.nan,
+                     "New/Review":new,"Coverage":f"{len(rh)}/{len(rg)}",
+                     "median/alert":med,"max/alert":mx})
+    return pd.DataFrame(rows)
+
+jobs = [(t, dset) for dset in ({"LINKED"}, {"LINKED","INSUFFICIENT_EVIDENCE"})
+                  for t in range(0, 11)]
+jobs.append((0, {"LINKED","NOT_LINKED","INSUFFICIENT_EVIDENCE"}))   # ceiling
+
+frames = [scorecard_fast(t, d) for t, d in tqdm(jobs, desc="threshold sweep", unit="cfg")]
+sweep = pd.concat(frames, ignore_index=True)
+sweep.loc[sweep.decisions.str.contains("NOT_LINKED"), "decisions"] = "CEILING"
+
+for level in ["L1 Control","L1 Library Control"]:
+    print(f"\n{'='*72}\n{level}\n{'='*72}")
+    print(sweep[sweep.level==level]
+          [["decisions","threshold","Recall","Validated","Missed","New/Review","median/alert"]]
+          .to_string(index=False))
+sweep.to_csv(OUTP/"laneA_v21_threshold_sweep.csv", index=False)
 
 
