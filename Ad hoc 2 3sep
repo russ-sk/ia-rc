@@ -147,5 +147,60 @@ def scorecard_at(threshold, show=True):
 THRESHOLD = 0
 scorecard_at(THRESHOLD)
 
+# %% Export missed golden 1C (with alert + control text) for selected alerts --
+SELECT_ALERTS = ["139559", "141013"]     # <- the alerts you want to inspect
+THRESHOLD     = 7                         # what counts as "predicted"
+TOPN          = 10
+
+BAD = {"-","","nan","none","null","nat"}
+gg = gold.copy()
+for c in ["RECORD_ID","L1_CTRL"]: gg[c]=gg[c].astype(str).str.strip()
+gg = gg[~gg.L1_CTRL.str.lower().isin(BAD)]
+
+v = verdicts.copy(); v["RECORD_ID"]=v.RECORD_ID.astype(str).str.strip()
+v["L1_CTRL"]=v.L1_CTRL.astype(str).str.strip()
+# what we predicted at this threshold
+pred_pairs = {(r,c) for r,c in
+              v.loc[v.ctrl_score>=THRESHOLD, ["RECORD_ID","L1_CTRL"]]
+               .itertuples(index=False,name=None)}
+# judge score/reasoning lookup for any scored (record,1C)
+vlook = v.set_index(["RECORD_ID","L1_CTRL"])[["ctrl_score","reasoning","cosine"]]
+
+rows=[]
+for rid in [str(a).strip() for a in SELECT_ALERTS]:
+    gold_here = set(gg.loc[gg.RECORD_ID==rid, "L1_CTRL"])
+    missed = [c for c in gold_here if (rid,c) not in pred_pairs]
+    for c in missed:
+        if (rid,c) in vlook.index:
+            r = vlook.loc[(rid,c)]
+            score = int(r.ctrl_score) if pd.notna(r.ctrl_score) else None
+            reason = r.reasoning; cosine = r.cosine
+            status = "scored_below_threshold" if (score is not None and score>=0) else "errored"
+        else:
+            score, reason, cosine, status = None, None, None, "not_a_candidate"
+        rows.append({"RECORD_ID": rid,
+                     "alert_text": atext.get(rid, ""),
+                     "L1_CTRL": c,
+                     "control_text": ctext.get(c, ""),
+                     "judge_score": score,
+                     "cosine": cosine,
+                     "miss_reason": status,
+                     "judge_reasoning": reason})
+
+miss = pd.DataFrame(rows)
+# top 10 per alert: highest-scored near-misses first, then unscored
+miss["_ord"] = miss.judge_score.fillna(-1)
+miss = (miss.sort_values(["RECORD_ID","_ord"], ascending=[True,False])
+            .groupby("RECORD_ID").head(TOPN).drop(columns="_ord"))
+
+print(miss.groupby("RECORD_ID").size().rename("missed_shown").to_string())
+print(miss.miss_reason.value_counts().to_string())
+
+path = OUTP / "missed_1c_pairs.xlsx"
+miss.to_excel(path, index=False)
+print(f"\nsaved -> {path}   rows={len(miss)}")
+miss.head(20)
+
+
 
 
