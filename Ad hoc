@@ -617,6 +617,9 @@ if len(verdicts):
     if len(lk): print(f"  grounded on LINKED: {lk.evidence_grounded.mean():.1%}")
     print(f"  accepted {len(accepted)} of {len(verdicts)}  ->  1C={accepted.L1_CTRL.nunique() if len(accepted) else 0}")
 
+g = globals()
+print({n: (n in g) for n in ["oai","tok","MODEL","USAGE","clean","embed_cache"]})
+print("MODEL =", MODEL, " | embed_cache is embed_with_cache:", embed_cache is embed_with_cache)
 
 
 
