@@ -1,0 +1,33 @@
+# %% Golden fan-out: RSM -> L1C, and L1C -> 1C --------------------------------
+BAD = {"-","","nan","none","null","nat"}
+g = gold.copy()
+for c in ["SUM_ID","L1_LIB_CTRL","L1_CTRL"]:
+    g[c] = g[c].astype(str).str.strip()
+
+def clean(df, col): return df[~df[col].str.lower().isin(BAD)]
+
+# --- library controls per RSM ---
+gr = clean(clean(g, "SUM_ID"), "L1_LIB_CTRL")
+lc_per_rsm = gr.groupby("SUM_ID").L1_LIB_CTRL.nunique()
+print("LIBRARY CONTROLS (L1C) PER RSM")
+print(f"  RSMs with >=1 L1C : {len(lc_per_rsm):,}")
+print(f"  mean {lc_per_rsm.mean():.1f}  median {lc_per_rsm.median():.0f}  "
+      f"min {lc_per_rsm.min()}  max {lc_per_rsm.max()}")
+print(lc_per_rsm.describe(percentiles=[.5,.9,.99]).round(1).to_string())
+
+# --- control instances per library control ---
+gi = clean(clean(g, "L1_LIB_CTRL"), "L1_CTRL")
+ic_per_lc = gi.groupby("L1_LIB_CTRL").L1_CTRL.nunique()
+print("\nCONTROL INSTANCES (1C) PER LIBRARY CONTROL (L1C)")
+print(f"  L1C with >=1 instance : {len(ic_per_lc):,}")
+print(f"  mean {ic_per_lc.mean():.1f}  median {ic_per_lc.median():.0f}  "
+      f"min {ic_per_lc.min()}  max {ic_per_lc.max()}")
+print(ic_per_lc.describe(percentiles=[.5,.9,.99]).round(1).to_string())
+
+# per-row detail if you want to eyeball it
+rsm_detail = lc_per_rsm.sort_values(ascending=False).rename("n_library_controls").reset_index()
+lc_detail  = ic_per_lc.sort_values(ascending=False).rename("n_control_instances").reset_index()
+print("\ntop RSMs by L1C count:")
+print(rsm_detail.head(10).to_string(index=False))
+print("\ntop L1C by instance count:")
+print(lc_detail.head(10).to_string(index=False))
