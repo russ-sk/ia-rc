@@ -1,0 +1,180 @@
+# %% A7. Judge the 1C controls (score everything, accept nothing here) --------
+CTRL_SYSTEM_PROMPT = """ROLE:
+You are a Lead Operational Risk & Controls Analyst at a Tier-1 Global Bank, expert in
+deciding whether an internal control is affected by an external regulatory change.
+
+CONTEXT:
+An incoming regulatory alert has already been linked to one or more regulation summaries.
+Each summary carries candidate L1 controls. Decide which of these controls the alert
+genuinely bears on — controls whose design or operation the alert would change, constrain,
+or create obligations for.
+
+Rules of Execution:
+1. Populate "reasoning" BEFORE deciding.
+2. Evaluate EACH candidate control independently against the alert.
+3. "decision" is exactly one of LINKED / NOT_LINKED / INSUFFICIENT_EVIDENCE.
+4. Judge on whether the alert affects what this control must do — not shared vocabulary.
+5. "evidence_from_alert" is an exact verbatim substring of the alert, or null.
+6. "link_score" is an integer 0-10 for how directly the alert bears on the control.
+7. Return exactly one verdict per supplied l1_control_id. Never invent an ID.
+"""
+CTRL_SCHEMA = {"type":"json_schema","json_schema":{"name":"ctrl_verdicts","strict":True,"schema":{
+    "type":"object","additionalProperties":False,"required":["items"],
+    "properties":{"items":{"type":"array","items":{
+        "type":"object","additionalProperties":False,
+        "required":["l1_control_id","reasoning","decision","link_score","evidence_from_alert"],
+        "properties":{"l1_control_id":{"type":"string"},"reasoning":{"type":"string"},
+            "decision":{"type":"string","enum":["LINKED","NOT_LINKED","INSUFFICIENT_EVIDENCE"]},
+            "link_score":{"type":"integer"},"evidence_from_alert":{"type":["string","null"]}}}}}}}}
+
+def _judge_kwargs():
+    k = dict(model=MODEL, max_tokens=LANE_HP["max_tokens"],
+             response_format=CTRL_SCHEMA, user=USE_CASE)   # user REQUIRED by gateway
+    if str(globals().get("MODEL_FAMILY","")).lower() == "gpt":
+        k["seed"] = 42
+    return k
+
+async def judge_ctrls(alert_text, cands):
+    payload = {"alert_text": alert_text,
+               "controls": [{"l1_control_id": i, "control_text": t} for i, t in cands]}
+    msgs = [{"role":"system","content":CTRL_SYSTEM_PROMPT},
+            {"role":"user","content":json.dumps(payload, ensure_ascii=False)}]
+    last=None
+    for att in range(LANE_HP["max_retries"]):
+        try:
+            t = await tok.get()
+            r = await oai.chat.completions.create(
+                **_judge_kwargs(), messages=msgs,
+                extra_headers={"X-HSBC-E2E-Trust-Token": t})
+            u=r.usage; USAGE.append({"kind":"chat","in":u.prompt_tokens,"out":u.completion_tokens,"ts":time.time()})
+            return json.loads(r.choices[0].message.content)["items"]
+        except Exception as e:
+            last=e
+            if "401" in str(e) or "unauth" in str(e).lower():
+                await tok.invalidate()
+            await asyncio.sleep(1.5 ** (att+1))
+    return [{"l1_control_id":i,"decision":"ERROR","link_score":0,
+             "reasoning":f"n/a: {last}","evidence_from_alert":None} for i,_ in cands]
+
+async def run_judge():
+    sem  = asyncio.Semaphore(LANE_HP["concurrency"])
+    CH   = LANE_HP["chunk"]
+    jobs = [(rid, per_alert[rid][s:s+CH])
+            for rid in per_alert for s in range(0, len(per_alert[rid]), CH)]
+    bar   = tqdm(total=len(jobs), desc="judge: batches", unit="batch")
+    tally = {"LINKED":0,"NOT_LINKED":0,"INSUFFICIENT_EVIDENCE":0,"ERROR":0}
+    async def one(rid, chunk):
+        async with sem:
+            items = await judge_ctrls(atext[rid], [(c, ctext[c]) for c in chunk])
+            rank = {c:i+1 for i,c in enumerate(per_alert[rid])}
+            out=[]
+            for it in items:
+                ev=it.get("evidence_from_alert"); tally[it["decision"]]=tally.get(it["decision"],0)+1
+                out.append({"RECORD_ID":rid,"L1_CTRL":it["l1_control_id"],"decision":it["decision"],
+                    "ctrl_score":it.get("link_score",0),"reasoning":it.get("reasoning"),
+                    "evidence_from_alert":ev,
+                    "evidence_grounded":bool(ev) and len(_nrm(ev))>=8 and _nrm(ev) in _nrm(atext[rid]),
+                    "cosine":cos.get((rid,it["l1_control_id"])),"cosine_rank":rank.get(it["l1_control_id"])})
+            bar.update(1); bar.set_postfix(linked=tally["LINKED"],rej=tally["NOT_LINKED"],err=tally["ERROR"])
+            return out
+    rows=[]
+    try:
+        for f in asyncio.as_completed([asyncio.create_task(one(r,ch)) for r,ch in jobs]):
+            rows += await f
+    finally: bar.close()
+    return pd.DataFrame(rows)
+
+nest_asyncio.apply()
+if per_alert:
+    verdicts = asyncio.get_event_loop().run_until_complete(run_judge())
+    verdicts.to_parquet(OUTP/"laneA_v21_all_verdicts.parquet", index=False)
+else:
+    verdicts = pd.DataFrame()
+
+print("A7 CHECK")
+if len(verdicts):
+    print(f"  verdicts: {verdicts.decision.value_counts().to_dict()}")
+    lk = verdicts[verdicts.decision=="LINKED"]
+    if len(lk):
+        print(f"  grounded on LINKED: {lk.evidence_grounded.mean():.1%}")
+        print(f"  ctrl_score dist on LINKED: {lk.ctrl_score.value_counts().sort_index().to_dict()}")
+
+# %% A8. Golden
+GOLDEN_PATH = str(Path(DATA_DIR) / "golden_dataset_US_exploded_31aug26.parquet")
+G={"RECORD_ID":"Record ID","REG_ID":"Regulation ID",
+   "SUM_ID":"RegMap Regulation Summary ID",
+   "L1_LIB_CTRL":"Regulation Summary L1 Library Control ID Number",
+   "L1_CTRL":"L1 Control ID"}
+g_raw=pd.read_parquet(GOLDEN_PATH); g_raw.columns=[str(c).strip() for c in g_raw.columns]
+gren={}
+for short,label in G.items():
+    try: gren[resolve(g_raw,label)]=short
+    except KeyError: print(f"[!] golden missing {label!r}")
+gold=g_raw.rename(columns=gren)[[s for s in G if s in gren.values()]].copy()
+for c in gold.columns:
+    s=gold[c].astype(str).str.strip(); gold[c]=s.where(~s.str.lower().isin(PLACEHOLDER),np.nan)
+gold=gold.drop_duplicates()
+gold["RECORD_ID"]=gold.RECORD_ID.astype(str).str.strip()
+print("A8 CHECK", f"records={gold.RECORD_ID.nunique()} 1C={gold.L1_CTRL.nunique()} "
+      f"L1C={gold.L1_LIB_CTRL.nunique()}")
+
+
+# %% A9. Threshold-driven scorecard -------------------------------------------
+def _sets(df, rid, col):
+    if col not in df.columns: return set()
+    s = df.loc[df.RECORD_ID.astype(str).str.strip()==str(rid), col]
+    return {x for x in s.dropna().astype(str).str.strip() if x.lower() not in PLACEHOLDER}
+
+ALL_GOLD = sorted(set(gold.RECORD_ID))
+
+def scorecard_at(threshold, decisions={"LINKED"}, show=True):
+    acc = verdicts[verdicts.decision.isin(decisions) & (verdicts.ctrl_score >= threshold)]
+    p   = acc.merge(c2lc, on="L1_CTRL", how="left")
+    pred = {"L1 Control":       (p[["RECORD_ID","L1_CTRL"]], "L1_CTRL"),
+            "L1 Library Control":(p.dropna(subset=["L1_LIB_CTRL"])[["RECORD_ID","L1_LIB_CTRL"]], "L1_LIB_CTRL")}
+    rows=[]
+    for level,(pdf,pcol) in pred.items():
+        pdf=pdf.copy(); pdf["RECORD_ID"]=pdf.RECORD_ID.astype(str).str.strip()
+        gcol = "L1_CTRL" if level=="L1 Control" else "L1_LIB_CTRL"
+        gp={(r,x) for r in ALL_GOLD for x in _sets(gold,r,gcol)}
+        pp={(r,x) for r in set(pdf.RECORD_ID) for x in _sets(pdf,r,pcol)}
+        val,miss,new=len(gp&pp),len(gp-pp),len(pp-gp)
+        rg={r for r,_ in gp}; rh={r for r,_ in (gp&pp)}
+        per=pdf.groupby("RECORD_ID")[pcol].nunique()
+        rows.append({"threshold":threshold,"decisions":"+".join(sorted(decisions)),
+                     "level":level,"Golden":len(gp),"Validated":val,"Missed":miss,
+                     "Recall":round(val/len(gp),3) if gp else np.nan,
+                     "New/Review":new,"Coverage":f"{len(rh)}/{len(rg)}",
+                     "median/alert":int(per.median()) if len(per) else 0,
+                     "max/alert":int(per.max()) if len(per) else 0})
+    card=pd.DataFrame(rows)
+    if show:
+        print(f"\n=== scorecard @ threshold {threshold}  decisions={sorted(decisions)} ===")
+        print(card.drop(columns=["decisions"]).to_string(index=False))
+    return card
+
+# ---- set your threshold here and read the scorecard ----
+THRESHOLD = 5
+scorecard_at(THRESHOLD)                                   # strict: LINKED only
+scorecard_at(THRESHOLD, decisions={"LINKED","INSUFFICIENT_EVIDENCE"})   # lenient
+
+
+# %% A10. Full sweep 0..10, both decision sets + judge ceiling ---------------
+frames=[]
+for dset in [{"LINKED"}, {"LINKED","INSUFFICIENT_EVIDENCE"}]:
+    for t in range(0,11):
+        frames.append(scorecard_at(t, decisions=dset, show=False))
+# ceiling = accept everything the judge scored, at threshold 0
+frames.append(scorecard_at(0, decisions={"LINKED","NOT_LINKED","INSUFFICIENT_EVIDENCE"}, show=False)
+              .assign(decisions="CEILING"))
+sweep=pd.concat(frames, ignore_index=True)
+
+for level in ["L1 Control","L1 Library Control"]:
+    print(f"\n{'='*70}\n{level}\n{'='*70}")
+    v=sweep[sweep.level==level]
+    print(v[["decisions","threshold","Recall","Validated","Missed","New/Review","median/alert"]]
+          .to_string(index=False))
+sweep.to_csv(OUTP/"laneA_v21_threshold_sweep.csv", index=False)
+
+
+
