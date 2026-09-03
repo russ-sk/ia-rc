@@ -621,5 +621,12 @@ g = globals()
 print({n: (n in g) for n in ["oai","tok","MODEL","USAGE","clean","embed_cache"]})
 print("MODEL =", MODEL, " | embed_cache is embed_with_cache:", embed_cache is embed_with_cache)
 
+def _judge_kwargs():
+    k = dict(model=MODEL, max_tokens=LANE_HP["max_tokens"],
+             response_format=CTRL_SCHEMA, user=USE_CASE)   # user is REQUIRED by the gateway
+    if str(globals().get("MODEL_FAMILY","")).lower() == "gpt":
+        k["seed"] = 42                                      # gpt-only
+    return k
+
 
 
