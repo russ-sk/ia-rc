@@ -403,5 +403,30 @@ print(f"\ncandidate pool size: E5={len(in_e5):,}  after top_k={len(in_pool):,}")
 print(f"alerts hitting top_k cap: "
       f"{sum(1 for r in per_alert if cand[cand.RECORD_ID.astype(str).str.strip()==str(r)].L1_CTRL.nunique() > LANE_HP['top_k'])}")
 
+# %% Distribution of L1 Control (1C) counts per alert in the golden -----------
+BAD = {"-","","nan","none","null","nat"}
+g = gold.copy()
+g["RECORD_ID"] = g.RECORD_ID.astype(str).str.strip()
+g["L1_CTRL"]   = g.L1_CTRL.astype(str).str.strip()
+g = g[~g.L1_CTRL.str.lower().isin(BAD)]
+
+per_alert = g.groupby("RECORD_ID").L1_CTRL.nunique()
+
+print(f"alerts with >=1 L1 control : {len(per_alert):,}")
+print(f"total distinct 1C linkages : {per_alert.sum():,}")
+print(f"per alert -> mean {per_alert.mean():.0f}  median {per_alert.median():.0f}  "
+      f"min {per_alert.min()}  max {per_alert.max()}\n")
+
+# binned 0-100, 100-200, 200-300, ...
+top   = int(per_alert.max())
+edges = list(range(0, top + 100, 100))
+labels = [f"{edges[i]+1:>4}-{edges[i+1]:<4}" for i in range(len(edges)-1)]
+bins = pd.cut(per_alert, bins=edges, labels=labels, right=True, include_lowest=True)
+
+dist = (bins.value_counts().reindex(labels, fill_value=0)
+        .rename_axis("controls_per_alert").reset_index(name="n_alerts"))
+dist["pct_alerts"] = (dist.n_alerts / len(per_alert) * 100).round(1)
+dist["cum_alerts"] = dist.n_alerts.cumsum()
+print(dist.to_string(index=False))
 
 
