@@ -344,3 +344,279 @@ pd.DataFrame(micro_all).to_csv(OUTP/"laneA_eval_micro_all.csv", index=False)
 per_record.to_csv(OUTP/"laneA_eval_per_record_all.csv", index=False)
 
 
+
+sep
+
+# %% A1. Config + helpers -----------------------------------------------------
+import re, json, time, asyncio, ast
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from tqdm.auto import tqdm
+
+pd.set_option("display.width", 220); pd.set_option("display.max_columns", 60)
+
+# --- bind this notebook's gateway objects to the names Lane A uses -----------
+oai    = openai_client            # AsyncOpenAI client
+tok    = trust_token             # TrustTokenCache()
+MODEL  = CHAT_MODEL              # "Gemini-2.5-flash"
+USAGE  = TOKEN_USAGE_LOG
+clean  = clean_text
+embed_cache = embed_with_cache   # (ids, texts, cache_tag) -> L2-normalised matrix
+
+REGMAP_DIR = Path(DATA_DIR) / "REGMAP"
+HELIOS_DIR = Path(DATA_DIR) / "Helios"
+OUTP       = Path(EXECUTION_OUTPUT_DIR)
+OUTP.mkdir(parents=True, exist_ok=True)
+
+STATUS_KEEP  = "published"
+KEEP_RECORDS = None
+PLACEHOLDER  = {"nan","none","nat","","-","null","<na>"}
+
+LANE_HP = {"top_k": 200, "max_tokens": HYPERPARAMS.get("max_tokens", 6000),
+           "concurrency": HYPERPARAMS.get("concurrency", 10),
+           "max_retries": HYPERPARAMS.get("max_retries", 3),
+           "min_score": 5, "chunk": 15}
+
+C = {
+    "JUR":"Regulation Jurisdiction","REG_ID":"Regulation ID",
+    "REG_STATUS":"Regulation Status","REG_VER":"Regulation Version",
+    "SUM_ID":"Regulation Summary ID","SUM_STATUS":"Regulation Summary Status",
+    "SUM_VER":"Regulation Summary Version",
+    "SUM_APPROACH":"Regulation Summary Control Mapping Approach",
+    "SUM_TITLE":"Regulation Summary Title","SUM_TEXT":"Regulation Summary Detail Text",
+    "SUM_TAX_L1":"Regulation Summary Risk Taxonomy L1",
+    "SUM_TAX_L2":"Regulation Summary Risk Taxonomy L2",
+    "SUM_TAX_L3":"Regulation Summary Risk Taxonomy L3",
+    "APPLIC_KEY":"Regulation Summary Applicability Unique Key",
+    "RISK_ID":"Risk ID","L1_CTRL":"L1 Control ID",
+}
+SUMMARY_KEY       = ["JUR","REG_ID","REG_STATUS","REG_VER","SUM_ID","SUM_STATUS","SUM_VER"]
+APPLICABILITY_KEY = SUMMARY_KEY + ["SUM_TAX_L1","SUM_TAX_L2","SUM_TAX_L3","APPLIC_KEY"]
+
+def _k(s): return re.sub(r"[^a-z0-9]", "", str(s).lower())
+def resolve(df, label):
+    ex=[c for c in df.columns if _k(c)==_k(label)]
+    if ex: return ex[0]
+    lo=[c for c in df.columns if _k(label) in _k(c)]
+    if len(lo)==1: return lo[0]
+    raise KeyError(f"cannot resolve {label!r}\n  in: {list(df.columns)}")
+def standardise(df, shorts):
+    return df.rename(columns={resolve(df, C[s]): s for s in shorts})[shorts].copy()
+def strip_ids(df, cols):
+    for c in cols:
+        if c in df.columns:
+            s=df[c].astype(str).str.strip()
+            df[c]=s.where(~s.str.lower().isin(PLACEHOLDER), np.nan)
+    return df
+def norm_approach(s):
+    a=s.astype(str).str.strip().str.title()
+    return a.where(~a.str.lower().isin(PLACEHOLDER), np.nan)
+def published(df):
+    n=len(df)
+    for c in ("REG_STATUS","SUM_STATUS"):
+        if c in df.columns:
+            df=df[df[c].astype(str).str.strip().str.casefold()==STATUS_KEEP]
+    if n and not len(df): raise ValueError(f"published filter emptied — check {STATUS_KEEP!r}")
+    return df.reset_index(drop=True)
+
+def _safe_parquet(path, columns=None):
+    import pyarrow as pa, pyarrow.parquet as pq
+    names=pq.ParquetFile(path).schema.names
+    cols=[c for c in columns if c in names] if columns else names
+    tbl=pq.read_table(path, columns=cols)
+    fixed=[]
+    for f in tbl.schema:
+        col=tbl.column(f.name)
+        try:
+            pd.api.types.pandas_dtype(f.type.to_pandas_dtype()); fixed.append(col)
+        except Exception:
+            fixed.append(pa.compute.cast(col, pa.string()))
+    return pa.table(fixed, names=tbl.schema.names).to_pandas()
+def _read_any(path, columns=None):
+    if path.suffix.lower()==".parquet":
+        try: df=_safe_parquet(path, columns)
+        except Exception:
+            import pyarrow as pa, pyarrow.parquet as pq
+            tbl=pq.read_table(path)
+            df=pa.table([pa.compute.cast(tbl.column(n),pa.string()) for n in tbl.schema.names],
+                        names=tbl.schema.names).to_pandas()
+            if columns: df=df[[c for c in columns if c in df.columns]]
+    else:
+        df=(pd.read_csv(path,dtype=str) if path.suffix.lower()==".csv"
+            else pd.read_excel(path,dtype=str))
+        if columns: df=df[[c for c in columns if c in df.columns]]
+    df.columns=[str(c).strip() for c in df.columns]
+    print(f"[load] {path.name}: rows={len(df):,} cols={len(df.columns)}")
+    return df
+def _find(directory, stem):
+    hits=[p for p in Path(directory).iterdir()
+          if p.suffix.lower() in {".xlsx",".xls",".csv",".parquet"} and stem.lower() in p.name.lower()]
+    if not hits: raise FileNotFoundError(f"no {stem!r} in {directory}")
+    return sorted(hits)[0]
+def read_regmap(n):
+    hits=[x for x in REGMAP_DIR.iterdir()
+          if x.suffix.lower() in {".xlsx",".xls",".csv",".parquet"}
+          and re.search(rf"extract\s*_?{n}\b", x.name, flags=re.I)]
+    return _read_any(sorted(hits)[0])
+def read_helios(stem, usecols=None): return _read_any(_find(HELIOS_DIR, stem), columns=usecols)
+def joinset(s): return " | ".join(sorted({str(x) for x in s if pd.notna(x)}))
+def parse_id_list(v):
+    if isinstance(v,(list,tuple,set)): items=list(v)
+    elif v is None or (isinstance(v,float) and pd.isna(v)): return []
+    else:
+        s=str(v).strip()
+        if s[:1] in "[(":
+            try: items=list(ast.literal_eval(s))
+            except Exception: items=re.split(r"[|,;]", s.strip("[]() "))
+        else: items=re.split(r"[|,;]", s)
+    out=[]
+    for x in items:
+        x=str(x).strip().strip("'\"")
+        if x and x.lower() not in PLACEHOLDER: out.append(x)
+    return out
+def _nrm(s): return re.sub(r"\s+"," ",str(s)).strip().lower()
+
+print("A1 CHECK — bound:", all(x in dir() for x in ["oai","tok","MODEL","USAGE","clean","embed_cache"]))
+print("  regmap:", REGMAP_DIR.exists(), " helios:", HELIOS_DIR.exists(), " out:", OUTP)
+
+
+# %% A6. Candidate 1C controls + embeddings ----------------------------------
+cand = (a_sum[["RECORD_ID","REG_ID","SUM_ID","SUM_APPROACH","alert_text"]]
+        .merge(cand_ctrl, on=["REG_ID","SUM_ID"], how="inner"))
+
+need    = sorted(set(cand.L1_CTRL) & set(inst.L1_CTRL))
+missing = sorted(set(cand.L1_CTRL) - set(inst.L1_CTRL))
+ctext   = inst.set_index("L1_CTRL").ctrl_text.to_dict()
+per_alert, cos, atext = {}, {}, {}
+
+if need:
+    ctrl_vecs = embed_cache(need, [ctext[i] for i in need], "helios_l1_controls")
+    cpos = {i:n for n,i in enumerate(need)}
+
+    a_ids  = sorted(cand.RECORD_ID.unique())
+    atext  = cand.drop_duplicates("RECORD_ID").set_index("RECORD_ID").alert_text.to_dict()
+    a_vecs = embed_cache(a_ids, [atext[i] for i in a_ids], "alerts")
+    apos   = {i:n for n,i in enumerate(a_ids)}
+
+    for rid in tqdm(a_ids, desc="shortlist", unit="alert", leave=False):
+        pool = [c for c in cand.loc[cand.RECORD_ID==rid,"L1_CTRL"].unique() if c in cpos]
+        if not pool: continue
+        sims  = ctrl_vecs[[cpos[c] for c in pool]] @ a_vecs[apos[rid]]
+        order = np.argsort(-sims)[:LANE_HP["top_k"]]
+        per_alert[rid] = [pool[i] for i in order]
+        for i in order: cos[(rid, pool[i])] = float(sims[i])
+
+print("A6 CHECK")
+print(f"  candidate (rec,sum,1C) rows={len(cand):,}  1C={cand.L1_CTRL.nunique()}  "
+      f"alerts={cand.RECORD_ID.nunique()}")
+print(f"  1C with Helios text={len(need)}  without={len(missing)}")
+if per_alert:
+    ps=pd.Series({r:cand.loc[cand.RECORD_ID==r,'L1_CTRL'].nunique() for r in per_alert})
+    print(f"  pool/alert median={ps.median():.0f} max={ps.max()}  "
+          f"top_k bites on {(ps>LANE_HP['top_k']).sum()} alerts")
+
+
+# %% A7. Judge the 1C controls -----------------------------------------------
+CTRL_SYSTEM_PROMPT = """ROLE:
+You are a Lead Operational Risk & Controls Analyst at a Tier-1 Global Bank, expert in
+deciding whether an internal control is affected by an external regulatory change.
+
+CONTEXT:
+An incoming regulatory alert has already been linked to one or more regulation summaries.
+Each summary carries candidate L1 controls. Decide which of these controls the alert
+genuinely bears on — controls whose design or operation the alert would change, constrain,
+or create obligations for.
+
+Rules of Execution:
+1. Populate "reasoning" BEFORE deciding.
+2. Evaluate EACH candidate control independently against the alert.
+3. "decision" is exactly one of LINKED / NOT_LINKED / INSUFFICIENT_EVIDENCE.
+4. Judge on whether the alert affects what this control must do — not shared vocabulary.
+5. "evidence_from_alert" is an exact verbatim substring of the alert, or null.
+6. "link_score" is an integer 0-10 for how directly the alert bears on the control.
+7. Return exactly one verdict per supplied l1_control_id. Never invent an ID.
+"""
+CTRL_SCHEMA = {"type":"json_schema","json_schema":{"name":"ctrl_verdicts","strict":True,"schema":{
+    "type":"object","additionalProperties":False,"required":["items"],
+    "properties":{"items":{"type":"array","items":{
+        "type":"object","additionalProperties":False,
+        "required":["l1_control_id","reasoning","decision","link_score","evidence_from_alert"],
+        "properties":{"l1_control_id":{"type":"string"},"reasoning":{"type":"string"},
+            "decision":{"type":"string","enum":["LINKED","NOT_LINKED","INSUFFICIENT_EVIDENCE"]},
+            "link_score":{"type":"integer"},"evidence_from_alert":{"type":["string","null"]}}}}}}}}
+
+def _judge_kwargs():
+    k = dict(model=MODEL, max_tokens=LANE_HP["max_tokens"], response_format=CTRL_SCHEMA)
+    if str(globals().get("MODEL_FAMILY","")).lower() == "gpt":   # gemini rejects seed/user
+        k["seed"] = 42; k["user"] = USE_CASE
+    return k
+
+async def judge_ctrls(alert_text, cands):
+    payload = {"alert_text": alert_text,
+               "controls": [{"l1_control_id": i, "control_text": t} for i, t in cands]}
+    msgs = [{"role":"system","content":CTRL_SYSTEM_PROMPT},
+            {"role":"user","content":json.dumps(payload, ensure_ascii=False)}]
+    last=None
+    for att in range(LANE_HP["max_retries"]):
+        try:
+            t = await tok.get()
+            r = await oai.chat.completions.create(
+                **_judge_kwargs(), messages=msgs,
+                extra_headers={"X-HSBC-E2E-Trust-Token": t})
+            u=r.usage; USAGE.append({"kind":"chat","in":u.prompt_tokens,"out":u.completion_tokens,"ts":time.time()})
+            return json.loads(r.choices[0].message.content)["items"]
+        except Exception as e:
+            last=e
+            if "401" in str(e) or "unauth" in str(e).lower():
+                await tok.invalidate()
+            await asyncio.sleep(1.5 ** (att+1))
+    return [{"l1_control_id":i,"decision":"ERROR","link_score":0,
+             "reasoning":f"n/a: {last}","evidence_from_alert":None} for i,_ in cands]
+
+async def run_judge():
+    sem  = asyncio.Semaphore(LANE_HP["concurrency"])
+    CH   = LANE_HP["chunk"]
+    jobs = [(rid, per_alert[rid][s:s+CH])
+            for rid in per_alert for s in range(0, len(per_alert[rid]), CH)]
+    bar   = tqdm(total=len(jobs), desc="judge: batches", unit="batch")
+    tally = {"LINKED":0,"NOT_LINKED":0,"INSUFFICIENT_EVIDENCE":0,"ERROR":0}
+    async def one(rid, chunk):
+        async with sem:
+            items = await judge_ctrls(atext[rid], [(c, ctext[c]) for c in chunk])
+            rank = {c:i+1 for i,c in enumerate(per_alert[rid])}
+            out=[]
+            for it in items:
+                ev=it.get("evidence_from_alert"); tally[it["decision"]]=tally.get(it["decision"],0)+1
+                out.append({"RECORD_ID":rid,"L1_CTRL":it["l1_control_id"],"decision":it["decision"],
+                    "ctrl_score":it.get("link_score",0),"reasoning":it.get("reasoning"),
+                    "evidence_from_alert":ev,
+                    "evidence_grounded":bool(ev) and len(_nrm(ev))>=8 and _nrm(ev) in _nrm(atext[rid]),
+                    "cosine":cos.get((rid,it["l1_control_id"])),"cosine_rank":rank.get(it["l1_control_id"])})
+            bar.update(1); bar.set_postfix(linked=tally["LINKED"],rej=tally["NOT_LINKED"],err=tally["ERROR"])
+            return out
+    rows=[]
+    try:
+        for f in asyncio.as_completed([asyncio.create_task(one(r,ch)) for r,ch in jobs]):
+            rows += await f
+    finally: bar.close()
+    return pd.DataFrame(rows)
+
+nest_asyncio.apply()
+if per_alert:
+    verdicts = asyncio.get_event_loop().run_until_complete(run_judge())
+    accepted = verdicts[(verdicts.decision=="LINKED")&(verdicts.ctrl_score>=LANE_HP["min_score"])]
+    verdicts.to_parquet(OUTP/"laneA_v21_all_verdicts.parquet", index=False)
+else:
+    verdicts, accepted = pd.DataFrame(), pd.DataFrame()
+
+print("A7 CHECK")
+if len(verdicts):
+    print(f"  verdicts: {verdicts.decision.value_counts().to_dict()}")
+    lk = verdicts[verdicts.decision=='LINKED']
+    if len(lk): print(f"  grounded on LINKED: {lk.evidence_grounded.mean():.1%}")
+    print(f"  accepted {len(accepted)} of {len(verdicts)}  ->  1C={accepted.L1_CTRL.nunique() if len(accepted) else 0}")
+
+
+
+
