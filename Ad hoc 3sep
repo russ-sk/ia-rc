@@ -377,4 +377,31 @@ for level in ["L1 Control","L1 Library Control"]:
           .to_string(index=False))
 sweep.to_csv(OUTP/"laneA_v21_threshold_sweep.csv", index=False)
 
+# %% CEILING DECOMPOSITION — where do golden 1C controls fall out?
+BAD = {"-","","nan","none","null","nat"}
+g = gold.copy()
+for c in ["RECORD_ID","L1_CTRL"]: g[c] = g[c].astype(str).str.strip()
+gold_1c = {(r,c) for r,c in g[["RECORD_ID","L1_CTRL"]].itertuples(index=False,name=None)
+           if c.lower() not in BAD}
+
+def pairset(df, col):
+    d=df.copy(); d["RECORD_ID"]=d.RECORD_ID.astype(str).str.strip()
+    d[col]=d[col].astype(str).str.strip()
+    return {(r,c) for r,c in d[["RECORD_ID",col]].itertuples(index=False,name=None)
+            if c.lower() not in BAD}
+
+in_e5   = pairset(cand, "L1_CTRL")                 # candidates from E5 (before top_k)
+in_pool = {(r,c) for r in per_alert for c in per_alert[r]}   # after top_k shortlist
+in_judg = pairset(verdicts[verdicts.ctrl_score>=0], "L1_CTRL")
+
+N=len(gold_1c)
+print(f"golden 1C pairs                     : {N:,}")
+print(f"  present in E5 candidate set        : {len(gold_1c & in_e5):,}  ({len(gold_1c&in_e5)/N:.1%})  <- TRUE CEILING")
+print(f"  survived top_k shortlist           : {len(gold_1c & in_pool):,}  ({len(gold_1c&in_pool)/N:.1%})")
+print(f"  actually scored by judge           : {len(gold_1c & in_judg):,}  ({len(gold_1c&in_judg)/N:.1%})")
+print(f"\ncandidate pool size: E5={len(in_e5):,}  after top_k={len(in_pool):,}")
+print(f"alerts hitting top_k cap: "
+      f"{sum(1 for r in per_alert if cand[cand.RECORD_ID.astype(str).str.strip()==str(r)].L1_CTRL.nunique() > LANE_HP['top_k'])}")
+
+
 
