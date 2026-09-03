@@ -429,4 +429,42 @@ dist["pct_alerts"] = (dist.n_alerts / len(per_alert) * 100).round(1)
 dist["cum_alerts"] = dist.n_alerts.cumsum()
 print(dist.to_string(index=False))
 
+# %% A7b. Token usage export --------------------------------------------------
+import datetime as _dt
+
+usage = pd.DataFrame(USAGE)                      # USAGE is TOKEN_USAGE_LOG
+if len(usage):
+    usage["in"]  = pd.to_numeric(usage["in"],  errors="coerce").fillna(0).astype(int)
+    usage["out"] = pd.to_numeric(usage["out"], errors="coerce").fillna(0).astype(int)
+    usage["total"] = usage["in"] + usage["out"]
+
+    # price from config if present, else the placeholder rates
+    price = globals().get("TOKEN_PRICE", {"in": 0.30/1e6, "out": 2.50/1e6})
+    usage["cost_usd"] = usage["in"]*price["in"] + usage["out"]*price["out"]
+
+    summary = (usage.groupby("kind")
+               .agg(calls=("kind","size"),
+                    input_tokens=("in","sum"),
+                    output_tokens=("out","sum"),
+                    total_tokens=("total","sum"),
+                    cost_usd=("cost_usd","sum"))
+               .reset_index())
+    grand = pd.DataFrame([{"kind":"TOTAL","calls":summary.calls.sum(),
+                           "input_tokens":summary.input_tokens.sum(),
+                           "output_tokens":summary.output_tokens.sum(),
+                           "total_tokens":summary.total_tokens.sum(),
+                           "cost_usd":summary.cost_usd.sum()}])
+    summary = pd.concat([summary, grand], ignore_index=True)
+    summary["cost_usd"] = summary.cost_usd.round(2)
+
+    print(summary.to_string(index=False))
+
+    stamp = _dt.datetime.now().strftime("%Y%m%d")
+    path  = OUTP / f"token_usage_{stamp}.csv"
+    summary.to_csv(path, index=False)
+    print(f"\nsaved -> {path}")
+else:
+    print("TOKEN_USAGE_LOG is empty — run A6/A7 first")
+
+
 
