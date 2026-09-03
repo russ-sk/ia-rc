@@ -65,4 +65,87 @@ still_err = (verdicts.ctrl_score < 0).sum()
 print(f"after retry: errored still = {still_err}")
 verdicts.to_parquet(OUTP/"laneA_v21_all_verdicts_topk2000.parquet", index=False)
 
+# %% A8. Golden — Detailed-only ----------------------------------------------
+GOLDEN_PATH = str(Path(DATA_DIR) / "golden_dataset_US_exploded_with_control_mapping_03sep26.parquet")
+GOLD_APPROACH_KEEP = {"Detailed"}     # <- only these count; add "Enhanced" here if ever needed
+
+G={"RECORD_ID":"Record ID","REG_ID":"Regulation ID",
+   "SUM_ID":"RegMap Regulation Summary ID",
+   "SUM_APPROACH":"Regulation Summary Control Mapping Approach",
+   "L1_LIB_CTRL":"Regulation Summary L1 Library Control ID Number",
+   "L1_CTRL":"L1 Control ID"}
+g_raw=pd.read_parquet(GOLDEN_PATH); g_raw.columns=[str(c).strip() for c in g_raw.columns]
+gren={}
+for short,label in G.items():
+    try: gren[resolve(g_raw,label)]=short
+    except KeyError: print(f"[!] golden missing {label!r}")
+gold=g_raw.rename(columns=gren)[[s for s in G if s in gren.values()]].copy()
+for c in gold.columns:
+    s=gold[c].astype(str).str.strip(); gold[c]=s.where(~s.str.lower().isin(PLACEHOLDER),np.nan)
+
+# normalise approach and FILTER
+gold["SUM_APPROACH"] = gold.SUM_APPROACH.astype(str).str.strip().str.title()
+before = len(gold)
+gold = gold[gold.SUM_APPROACH.isin(GOLD_APPROACH_KEEP)].drop_duplicates()
+gold["RECORD_ID"]=gold.RECORD_ID.astype(str).str.strip()
+
+print("A8 CHECK")
+print(f"  approach filter: {before:,} -> {len(gold):,} rows  (kept {GOLD_APPROACH_KEEP})")
+print(f"  records={gold.RECORD_ID.nunique()}  1C={gold.L1_CTRL.nunique()}  "
+      f"L1C={gold.L1_LIB_CTRL.nunique()}")
+
+
+# %% A9. Threshold-driven scorecard — Detailed universe on BOTH sides ---------
+def _sets(df, rid, col):
+    if col not in df.columns: return set()
+    s = df.loc[df.RECORD_ID.astype(str).str.strip()==str(rid), col]
+    return {x for x in s.dropna().astype(str).str.strip() if x.lower() not in PLACEHOLDER}
+
+ALL_GOLD = sorted(set(gold.RECORD_ID))
+GTOT_1C  = {(r,x) for r in ALL_GOLD for x in _sets(gold,r,"L1_CTRL")}
+GTOT_L1C = {(r,x) for r in ALL_GOLD for x in _sets(gold,r,"L1_LIB_CTRL")}
+
+# (record, 1C) pairs that are candidates under a DETAILED summary — the eval universe
+cand_app = cand.copy()
+cand_app["RECORD_ID"] = cand_app.RECORD_ID.astype(str).str.strip()
+cand_app["SUM_APPROACH"] = cand_app.SUM_APPROACH.astype(str).str.strip().str.title()
+DETAILED_CAND = {(r,c) for r,c in
+    cand_app.loc[cand_app.SUM_APPROACH.isin(GOLD_APPROACH_KEEP), ["RECORD_ID","L1_CTRL"]]
+            .itertuples(index=False, name=None)
+    if str(c).lower() not in PLACEHOLDER}
+
+from collections import Counter
+def scorecard_at(threshold, show=True):
+    acc = verdicts[verdicts.ctrl_score >= threshold].copy()
+    acc["RECORD_ID"] = acc.RECORD_ID.astype(str).str.strip()
+    # keep only predictions in the Detailed universe
+    acc = acc[[ (r,c) in DETAILED_CAND
+                for r,c in zip(acc.RECORD_ID, acc.L1_CTRL.astype(str).str.strip()) ]]
+    p = acc.merge(c2lc, on="L1_CTRL", how="left")
+    p1c  = {(r,c) for r,c in p[["RECORD_ID","L1_CTRL"]].itertuples(index=False,name=None)
+            if str(c).lower() not in PLACEHOLDER}
+    pl1c = {(r,c) for r,c in p.dropna(subset=["L1_LIB_CTRL"])[["RECORD_ID","L1_LIB_CTRL"]]
+                    .itertuples(index=False,name=None) if str(c).lower() not in PLACEHOLDER}
+    rows=[]
+    for level, pp, gtot in [("L1 Control", p1c, GTOT_1C),
+                            ("L1 Library Control", pl1c, GTOT_L1C)]:
+        val,miss,new = len(gtot&pp), len(gtot-pp), len(pp-gtot)
+        rg={r for r,_ in gtot}; rh={r for r,_ in (gtot&pp)}
+        per=Counter(r for r,_ in pp)
+        rows.append({"threshold":threshold,"level":level,"Golden":len(gtot),
+                     "Validated":val,"Missed":miss,
+                     "Recall":round(val/len(gtot),3) if gtot else np.nan,
+                     "New/Review":new,"Coverage":f"{len(rh)}/{len(rg)}",
+                     "median/alert":int(np.median(list(per.values()))) if per else 0,
+                     "max/alert":max(per.values()) if per else 0})
+    card=pd.DataFrame(rows)
+    if show:
+        print(f"\n=== scorecard @ threshold {threshold} (Detailed only) ===")
+        print(card.to_string(index=False))
+    return card
+
+THRESHOLD = 0
+scorecard_at(THRESHOLD)
+
+
 
