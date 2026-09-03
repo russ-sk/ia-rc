@@ -40,3 +40,29 @@ err_pairs = {(str(r).strip(), str(c).strip())
              for r,c in err_rows[["RECORD_ID","L1_CTRL"]].itertuples(index=False,name=None)}
 print("golden 1C lost to errors:", len(gold_1c & err_pairs))
 
+# %% A7-retry — re-judge only the truncated batches at a smaller chunk
+err_rows = verdicts[verdicts.ctrl_score < 0]
+retry_alerts = {rid: err_rows.loc[err_rows.RECORD_ID==rid, "L1_CTRL"].tolist()
+                for rid in err_rows.RECORD_ID.unique()}
+print(f"re-judging {sum(len(v) for v in retry_alerts.values()):,} candidates "
+      f"across {len(retry_alerts)} alerts")
+
+# run the judge over just these, at chunk 20, reusing the same machinery
+_per_alert_full = per_alert            # stash the full shortlist
+per_alert = retry_alerts
+LANE_HP["chunk"] = 20                   # smaller so 20 verdicts fit comfortably
+retry_verdicts = asyncio.get_event_loop().run_until_complete(run_judge())
+per_alert = _per_alert_full            # restore
+
+# merge: drop the errored rows, add the recovered ones
+key = ["RECORD_ID","L1_CTRL"]
+verdicts = pd.concat([
+    verdicts[verdicts.ctrl_score >= 0],           # keep the good rows
+    retry_verdicts                                # recovered (may still have a few errors)
+], ignore_index=True).drop_duplicates(key, keep="last")
+
+still_err = (verdicts.ctrl_score < 0).sum()
+print(f"after retry: errored still = {still_err}")
+verdicts.to_parquet(OUTP/"laneA_v21_all_verdicts_topk2000.parquet", index=False)
+
+
