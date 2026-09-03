@@ -201,6 +201,63 @@ miss.to_excel(path, index=False)
 print(f"\nsaved -> {path}   rows={len(miss)}")
 miss.head(20)
 
+# %% Readable pairwise print — missed golden 1C for selected alerts -----------
+SELECT_ALERTS = ["139559", "141013"]     # alerts to inspect
+THRESHOLD     = 7
+TOPN          = 10                        # missed controls to show per alert
+
+BAD = {"-","","nan","none","null","nat"}
+gg = gold.copy()
+for c in ["RECORD_ID","L1_CTRL"]: gg[c]=gg[c].astype(str).str.strip()
+gg = gg[~gg.L1_CTRL.str.lower().isin(BAD)]
+
+v = verdicts.copy(); v["RECORD_ID"]=v.RECORD_ID.astype(str).str.strip()
+v["L1_CTRL"]=v.L1_CTRL.astype(str).str.strip()
+pred_pairs = {(r,c) for r,c in v.loc[v.ctrl_score>=THRESHOLD,["RECORD_ID","L1_CTRL"]]
+              .itertuples(index=False,name=None)}
+vlook = v.set_index(["RECORD_ID","L1_CTRL"])[["ctrl_score","reasoning"]]
+
+lines = []
+for rid in [str(a).strip() for a in SELECT_ALERTS]:
+    gold_here = set(gg.loc[gg.RECORD_ID==rid, "L1_CTRL"])
+    missed = [c for c in gold_here if (rid,c) not in pred_pairs]
+    # near-misses first
+    missed = sorted(missed, key=lambda c: (vlook.loc[(rid,c),"ctrl_score"]
+                    if (rid,c) in vlook.index else -1), reverse=True)[:TOPN]
+
+    block = []
+    block.append("="*100)
+    block.append(f"ALERT  {rid}")
+    block.append("="*100)
+    block.append("ALERT TEXT:")
+    block.append(str(atext.get(rid, "<no alert text>")).strip())
+    block.append("")
+    block.append(f"MISSED GOLDEN CONTROLS (below threshold {THRESHOLD}): {len(missed)}")
+    block.append("-"*100)
+    for i, c in enumerate(missed, 1):
+        if (rid,c) in vlook.index:
+            r = vlook.loc[(rid,c)]
+            sc = int(r.ctrl_score) if pd.notna(r.ctrl_score) and r.ctrl_score>=0 else "n/a"
+            why = str(r.reasoning or "").strip()
+            status = "scored below threshold" if sc!="n/a" else "errored/unscored"
+        else:
+            sc, why, status = "—", "", "NOT A CANDIDATE (never judged)"
+        block.append(f"[{i}]  {c}   score={sc}   ({status})")
+        block.append(f"     CONTROL TEXT: {str(ctext.get(c,'<no text>')).strip()}")
+        if why:
+            block.append(f"     JUDGE SAID : {why}")
+        block.append("")
+    lines.append("\n".join(block))
+
+report = "\n".join(lines)
+print(report)
+
+# also save the readable text so you can share it
+path = OUTP / "missed_1c_readable.txt"
+path.write_text(report, encoding="utf-8")
+print(f"\nsaved -> {path}")
+
+
 
 
 
