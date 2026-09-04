@@ -257,6 +257,45 @@ path = OUTP / "missed_1c_readable.txt"
 path.write_text(report, encoding="utf-8")
 print(f"\nsaved -> {path}")
 
+# %% How many alerts would top_k miss? ----------------------------------------
+BAD = {"-","","nan","none","null","nat"}
+g = gold.copy()
+for c in ["RECORD_ID","L1_CTRL"]: g[c] = g[c].astype(str).str.strip()
+gold_pairs = {(r,c) for r,c in g[["RECORD_ID","L1_CTRL"]].itertuples(index=False,name=None)
+              if c.lower() not in BAD}
+
+v = verdicts.copy()
+v["RECORD_ID"] = v.RECORD_ID.astype(str).str.strip()
+v["L1_CTRL"]   = v.L1_CTRL.astype(str).str.strip()
+v = v[v.cosine_rank.notna()]                              # candidates that were ranked
+
+# golden controls that ARE candidates, with their cosine rank in the pool
+gv = v[[(r,c) in gold_pairs for r,c in zip(v.RECORD_ID, v.L1_CTRL)]][["RECORD_ID","L1_CTRL","cosine_rank"]]
+gv["cosine_rank"] = gv.cosine_rank.astype(int)
+
+# per alert: rank of its worst-placed golden control (the one that needs the largest top_k)
+worst = gv.groupby("RECORD_ID").cosine_rank.max()          # need top_k >= this to keep ALL golden
+best  = gv.groupby("RECORD_ID").cosine_rank.min()          # need top_k >= this to keep ANY golden
+n_alerts_with_gold = gv.RECORD_ID.nunique()
+total_gold_cand    = len(gv)
+
+print(f"alerts with >=1 golden control in the candidate pool: {n_alerts_with_gold}")
+print(f"golden controls that are candidates                 : {total_gold_cand:,}\n")
+
+rows=[]
+for K in [50,100,150,200,300,400,500,750,1000,1291,1500,2000]:
+    alerts_lose_any = int((worst > K).sum())               # >=1 golden control dropped
+    alerts_lose_all = int((best  > K).sum())               # ALL golden dropped -> alert fully missed
+    gold_dropped    = int((gv.cosine_rank > K).sum())      # golden controls cut
+    rows.append({"top_k":K,
+                 "alerts_losing_any_golden":alerts_lose_any,
+                 "alerts_fully_missed":alerts_lose_all,
+                 "golden_controls_dropped":gold_dropped,
+                 "golden_controls_kept":total_gold_cand-gold_dropped,
+                 "control_recall_ceiling":round(1-gold_dropped/total_gold_cand,3)})
+print(pd.DataFrame(rows).to_string(index=False))
+
+
 
 
 
