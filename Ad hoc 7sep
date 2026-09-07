@@ -52,3 +52,17 @@ print(f"reachability: {len(GOLD):,} golden 1C total | {len(GOLD_REACH):,} reacha
 gate = _clean(c["gate"]).str.upper().str.replace(" ", "_")
 PRED = {(r,x) for r,x,gt in zip(c["REC"], c["CTRL"], gate)
         if ("LINKED" in gt and "NOT_LINKED" not in gt) and x.lower() not in PLACEHOLDER}
+
+dec = _clean(c["DEC"]).str.upper()
+PRED = {(r,x) for r,x,d in zip(c["REC"], c["CTRL"], dec)
+        if d == "LINKED" and x.lower() not in PLACEHOLDER}
+
+# --- diagnostics: confirm PRED is populated and keys align ---
+print("DEC counts     :", dict(dec.value_counts()))
+print("len(PRED)      :", len(PRED))          # expect ~5518
+print("len(REACH)     :", len(REACH))
+print("len(GOLD)      :", len(GOLD), " len(GOLD_REACH):", len(GOLD & REACH))
+print("PRED sample    :", list(PRED)[:3])
+print("GOLD sample    :", list(GOLD)[:3])
+print("PRED∩GOLD      :", len(PRED & GOLD))    # <-- this is your TP; if 0, keys don't match
+
