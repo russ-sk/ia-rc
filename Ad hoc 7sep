@@ -1,0 +1,54 @@
+# %% L1 CONTROL SCORECARD  (recall computed on reachable==True golden only)
+import numpy as np, pandas as pd
+
+PLACEHOLDER = {"nan","none","nat","","-","null","<na>"}
+def _clean(s): return s.astype(str).str.strip()
+
+# ---- 1. predicted-linked and reachable pairs from the control output (image 1) ----
+c = control.copy()
+c["REC"]  = _clean(c["REC"]); c["CTRL"] = _clean(c["CTRL"])
+c["reachable"] = c["reachable"].astype(str).str.strip().str.lower().isin({"true","1"})
+dec = _clean(c["DEC"]).str.upper()
+
+PRED = {(r,x) for r,x,d in zip(c["REC"], c["CTRL"], dec)
+        if d == "LINKED" and x.lower() not in PLACEHOLDER}                 # judge said LINKED
+REACH = {(r,x) for r,x,ok in zip(c["REC"], c["CTRL"], c["reachable"])
+         if ok and x.lower() not in PLACEHOLDER}                          # reachable candidates
+
+# ---- 2. golden 1C pairs (image 2) ----
+g = golden.copy()
+g["RECORD_ID"] = _clean(g["RECORD_ID"]); g["L1_CTRL"] = _clean(g["L1_CTRL"])
+GOLD = {(r,x) for r,x in zip(g["RECORD_ID"], g["L1_CTRL"]) if x.lower() not in PLACEHOLDER}
+
+# ---- 3. restrict golden to the REACHABLE universe (recall is scored here) ----
+GOLD_REACH = GOLD & REACH                      # golden 1C that the pipeline could actually reach
+unreachable = len(GOLD) - len(GOLD_REACH)      # golden dropped as upstream/data gaps
+
+TP  = GOLD_REACH & PRED
+miss = GOLD_REACH - PRED
+newrev = PRED - GOLD                           # linked but not in golden (New/Review)
+
+rg = {r for r,_ in GOLD_REACH}; rh = {r for r,_ in TP}
+recall = len(TP)/len(GOLD_REACH) if GOLD_REACH else np.nan
+
+card = pd.DataFrame([{
+    "Level":"L1 Control",
+    "Golden links":len(GOLD),
+    "Golden (reachable)":len(GOLD_REACH),
+    "Validated (TP)":len(TP),
+    "Missed (FN)":len(miss),
+    "Recall":f"{recall*100:.0f}%",
+    "New/Review":len(newrev),
+    "Alert coverage":f"{len(rh)}/{len(rg)}",
+}])
+
+print("="*90); print("L1 CONTROL PERFORMANCE SCORECARD  (recall on reachable==True)"); print("="*90)
+print(card.to_string(index=False))
+print("-"*90)
+print(f"reachability: {len(GOLD):,} golden 1C total | {len(GOLD_REACH):,} reachable "
+      f"| {unreachable:,} unreachable ({unreachable/max(len(GOLD),1)*100:.0f}%) excluded from recall")
+
+
+gate = _clean(c["gate"]).str.upper().str.replace(" ", "_")
+PRED = {(r,x) for r,x,gt in zip(c["REC"], c["CTRL"], gate)
+        if ("LINKED" in gt and "NOT_LINKED" not in gt) and x.lower() not in PLACEHOLDER}
