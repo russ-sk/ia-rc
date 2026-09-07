@@ -66,3 +66,45 @@ print("PRED sample    :", list(PRED)[:3])
 print("GOLD sample    :", list(GOLD)[:3])
 print("PRED∩GOLD      :", len(PRED & GOLD))    # <-- this is your TP; if 0, keys don't match
 
+
+# %% PER-ALERT: predicted control set vs golden control set  (discovery possible?)
+import numpy as np, pandas as pd
+PLACEHOLDER = {"nan","none","nat","","-","null","<na>"}
+def _clean(s): return s.astype(str).str.strip()
+
+c = control.copy()
+c["REC"] = _clean(c["REC"]); c["CTRL"] = _clean(c["CTRL"])
+c = c[~c["CTRL"].str.lower().isin(PLACEHOLDER)]
+# every control judged for the alert, irrespective of linked / not-linked:
+# (optional) keep only reachable candidates -> uncomment next line
+# c = c[c["reachable"].astype(str).str.strip().str.lower().isin({"true","1"})]
+pred_by_alert = c.groupby("REC")["CTRL"].apply(set).to_dict()
+
+g = golden.copy()
+g["RECORD_ID"] = _clean(g["RECORD_ID"]); g["L1_CTRL"] = _clean(g["L1_CTRL"])
+g = g[~g["L1_CTRL"].str.lower().isin(PLACEHOLDER)]
+gold_by_alert = g.groupby("RECORD_ID")["L1_CTRL"].apply(set).to_dict()
+
+rows = []
+for rec in sorted(set(pred_by_alert) | set(gold_by_alert)):
+    p = pred_by_alert.get(rec, set())
+    gd = gold_by_alert.get(rec, set())
+    extra   = p - gd          # predicted controls NOT in golden -> possible new discovery
+    missing = gd - p          # golden controls the pipeline never surfaced for this alert
+    rows.append({"REC":rec, "n_pred":len(p), "n_gold":len(gd),
+                 "n_extra_(discovery_possible)":len(extra),
+                 "n_gold_not_surfaced":len(missing),
+                 "discovery_possible": len(extra) > 0})
+per_alert = pd.DataFrame(rows)
+
+print("PER-ALERT: predicted vs golden control sets")
+print(f"  alerts total                         : {len(per_alert)}")
+print(f"  alerts where predicted > golden (has extra controls): "
+      f"{per_alert['discovery_possible'].sum()}")
+print(f"  alerts where predicted ⊆ golden (no extra)          : "
+      f"{(~per_alert['discovery_possible']).sum()}")
+print(f"  total extra (non-golden) controls surfaced across alerts: "
+      f"{per_alert['n_extra_(discovery_possible)'].sum():,}")
+print()
+print(per_alert.sort_values('n_extra_(discovery_possible)', ascending=False).head(20).to_string(index=False))
+
