@@ -1,0 +1,30 @@
+# %% [4] -------- LOAD THE LIBRARY RISKS (the things we link alerts to) --------
+# A "library risk" is just an id + a description.
+# We will later ask: "is this alert related to this risk?"
+
+# STEP 1: tell Python where your library-risk file is, and which columns to use.
+#         (Change these three lines to match your actual file.)
+LIB_RISK_FILE = DATA_DIR + "library_risks.parquet"   # the file that holds the risks
+RISK_ID_COL   = "Library Risk ID"                    # the column with the risk id
+RISK_TEXT_COL = "Library Risk"                       # the column with the risk description
+
+
+# STEP 2: read the file into a table (a pandas DataFrame).
+risks_raw = pd.read_parquet(LIB_RISK_FILE)
+
+
+# STEP 3: keep only the two columns we care about, and give them simple names.
+risks = pd.DataFrame()
+risks["RISK_ID"]   = risks_raw[RISK_ID_COL].astype(str).str.strip()   # id as clean text
+risks["risk_text"] = risks_raw[RISK_TEXT_COL].map(clean_text)         # tidy the description
+
+
+# STEP 4: throw away rows with no description, and keep each risk only once.
+risks = risks[risks["risk_text"].str.len() > 0]       # drop empty descriptions
+risks = risks.drop_duplicates(subset="RISK_ID")       # one row per risk
+risks = risks.reset_index(drop=True)                  # tidy the row numbers
+
+
+# STEP 5: show how many we loaded, and peek at the first few.
+print("Number of library risks loaded:", len(risks))
+risks.head(3)
