@@ -197,3 +197,64 @@ for _, v in vd.head(2).iterrows():
     print("-" * 100)
 
 
+rows = []
+for _, v in vd.iterrows():
+    uid = v["obligationdetails_obligationuid"]
+    r = results.get(uid, {})
+    matches = r.get("matches", [])          # sorted best-first
+
+    rows.append({
+        # ---------------- VENDOR OBLIGATION ----------------
+        "Vendor Obligation ID":       uid,
+        "Vendor Citation":            v["vendor_citation"],
+        "Vendor Topic":               v["obligationdetails_topic"],
+        "Vendor Obligation Summary":  v["obligationdetails_obligationsummary"],
+
+        # ---------------- RESULT ----------------
+        "Matched RegMap Obligation IDs": ", ".join(m["obligation_id"] for m in matches) or "None",
+        "Best Match ID":                 matches[0]["obligation_id"] if matches else "None",
+        "Similarity Score (0-100)":      r.get("best_score"),
+        "Similarity Rating":             str(r.get("overall_similarity", "NONE")).title(),
+        "Match Scores":                  "; ".join(f"{m['obligation_id']} ({m['score']})" for m in matches),
+
+        # ---------------- STAKEHOLDER FIELDS ----------------
+        "Summary":           clean_narrative(r.get("summary", "")),
+        "Missing in RegMap": clean_narrative(r.get("missing_in_regmap", "")),
+        "Missing in Vendor": clean_narrative(r.get("missing_in_vendor", "")),
+
+        # ---------------- TECHNICAL AUDIT TRAIL (internal) ----------------
+        "Scoring Audit Trail": "\n".join(
+            f"{m['obligation_id']}: starts at 100"
+            + "".join(f" | -{d['points']} {d['code']} ({d['evidence']})" for d in m["deductions"])
+            + f" = {m['score']}"
+            for m in matches
+        ),
+    })
+
+comparison_df = pd.DataFrame(rows)
+
+# Quick checks
+print(comparison_df["Similarity Rating"].value_counts(), "\n")
+print(comparison_df["Similarity Score (0-100)"].describe(), "\n")
+all_codes = [d["code"] for r in results.values() for m in r.get("matches", []) for d in m["deductions"]]
+print("Most common gap types:\n", pd.Series(all_codes).value_counts())
+
+# Stakeholder version: drop the technical column
+stakeholder_df = comparison_df.drop(columns=["Scoring Audit Trail"])
+stakeholder_df.head()
+
+
+
+def clean_narrative(text):
+    """Strip scoring language but KEEP line breaks (so '- ' bullets stay on separate lines)."""
+    if not isinstance(text, str):
+        return ""
+    t = re.sub(r"\(?\s*[-+]?\d+\s*(points?|pts)\s*\)?", "", text, flags=re.I)  # "-10 points"
+    t = re.sub(r"\b(" + "|".join(RUBRIC.keys()) + r")\b", "", t)                # internal codes
+    t = re.sub(r"\b(score[ds]?|deduct(ed|ion|ions)?)\b", "", t, flags=re.I)     # scoring words
+    t = re.sub(r"[ \t]{2,}", " ", t)                                             # collapse spaces only, not newlines
+    return "\n".join(line.strip() for line in t.splitlines()).strip()
+
+
+
+
