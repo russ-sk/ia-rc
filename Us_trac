@@ -77,3 +77,55 @@ print("RegMap block size:", len(regmap_block), "characters")
 print(regmap_block[:600])   # preview the first couple of entries
 
 
+
+def build_prompt(v):
+    """
+    v = one row of the vendor table.
+    Returns the full prompt text for that vendor obligation.
+    """
+    return f"""You are a US regulatory compliance analyst for Regulation Z (Truth in Lending, 12 CFR 1026).
+
+TASK
+Compare ONE vendor obligation against the list of HSBC RegMap obligations below.
+Find every RegMap obligation that covers the same regulatory requirement.
+
+HOW TO JUDGE
+- Judge mainly on the MEANING of the vendor Summary versus the RegMap Text.
+- Use citations as supporting evidence only:
+    * same citation but a different requirement  -> NOT a match
+    * parent/different citation but same requirement -> CAN be a match
+- One vendor obligation may match several RegMap obligations, or none at all.
+
+SIMILARITY LEVELS (per match)
+  HIGH   = same requirement, nothing material missing
+  MEDIUM = same topic, but a condition, threshold, timing or exception is missing or different
+  LOW    = only loosely related
+
+STRICT RULES
+- Only use Obligation IDs that appear in the list. Never invent IDs.
+- Quote short phrases from BOTH texts as evidence.
+
+VENDOR OBLIGATION
+Citation: {v['vendor_citation']}
+Topic: {v['obligationdetails_topic']}
+Summary: {v['obligationdetails_obligationsummary']}
+
+REGMAP OBLIGATIONS
+{regmap_block}
+
+Return ONLY valid JSON (no markdown, no extra text) in exactly this shape:
+{{
+  "matches": [
+    {{"obligation_id": "ROB-...", "similarity": "HIGH|MEDIUM|LOW", "citation_agrees": true}}
+  ],
+  "overall_similarity": "HIGH|MEDIUM|LOW|NONE",
+  "missing_in_regmap": "requirements in the vendor obligation NOT covered by the matched RegMap obligations, with evidence",
+  "extra_in_regmap": "requirements in the matched RegMap obligations NOT in the vendor obligation, with evidence",
+  "reasoning": "why these match (or why none match), quoting evidence from both texts"
+}}"""
+
+# Preview the top of the prompt for the first vendor row (the RegMap list is long, so we cut it)
+print(build_prompt(vd.iloc[0])[:1500])
+
+
+
