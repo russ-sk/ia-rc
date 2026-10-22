@@ -1,7 +1,6 @@
 # ------------------------------------------------------------------
 # DEDUCTION RUBRIC (internal only - never shown to stakeholders)
 # Every match starts at 100; each gap found costs these points.
-# Tune the numbers here without touching the prompt.
 # ------------------------------------------------------------------
 RUBRIC = {
     "ACTOR_DIFFERENT":       15,
@@ -17,8 +16,7 @@ RUBRIC = {
     "EXTRA_IN_REGMAP":        3,
 }
 
-# Plain-English meaning of each code, shown to the model so it picks the right one.
-# Note: the model sees the MEANINGS, not the point values.
+# Plain-English meaning of each code (the model sees meanings, not point values)
 RUBRIC_MEANING = {
     "ACTOR_DIFFERENT":       "the obligated party differs (e.g. card issuer vs creditor)",
     "ACTION_PARTIAL":        "the core required or prohibited action is only partly covered",
@@ -32,54 +30,62 @@ RUBRIC_MEANING = {
     "CITATION_CLAUSE_DIFF":  "same section but a different or parent-level clause",
     "EXTRA_IN_REGMAP":       "RegMap contains a requirement not present in the vendor text",
 }
-
-# Turn the meanings into readable lines for the prompt
 rubric_text = "\n".join(f"  {k}: {RUBRIC_MEANING[k]}" for k in RUBRIC)
 
 
 def build_prompt(v):
-    """
-    v = one row of the vendor table.
-    Returns the full prompt text for that vendor obligation.
-    {{ and }} are doubled because this is an f-string; they become { } in the prompt.
-    """
+    """v = one vendor row. Returns the full prompt. {{ }} become { } in the f-string."""
     return f"""You are a senior US regulatory compliance analyst reviewing Regulation Z (Truth in Lending, 12 CFR 1026).
 Your written output will be read by senior compliance and risk stakeholders.
 
 TASK
 Compare ONE vendor-identified obligation against HSBC's internal RegMap obligations.
-Identify every RegMap obligation that addresses the SAME core requirement, assess how completely
-each one covers it, and explain the result in clear, professional language.
+Identify every RegMap obligation that addresses the SAME core requirement and describe the differences.
 
-STEP A - IDENTIFY CANDIDATES
+STEP A - IDENTIFY MATCHES
 Only list a RegMap obligation if it addresses the same core requirement
 (same subject matter AND the same kind of duty or prohibition).
-A matching citation alone is not sufficient. A different citation does not rule a match out.
+Judge mainly on the meaning of the text. Use citations as supporting evidence only:
+a matching citation alone is not sufficient, and a different citation does not rule a match out.
 
 STEP B - BREAK DOWN THE VENDOR OBLIGATION
 List its elements: obligated party, required/prohibited action, scope (products/accounts),
 conditions or triggers, timing, numeric thresholds, exceptions, other material details.
 
-STEP C - RECORD GAPS (for internal scoring only)
+STEP C - RECORD GAPS PER MATCH (internal use only)
 For each vendor element a RegMap obligation does not cover, or covers differently, record ONE gap
 using one of these codes. Also record requirements present in RegMap but absent from the vendor text.
 {rubric_text}
 Each gap must include short quoted evidence. Record each distinct gap once only.
 If a RegMap obligation fully covers the vendor obligation, its gaps list is empty.
 
-STEP D - WRITE THE STAKEHOLDER NARRATIVE
-Write in formal, precise, professional English suitable for a senior compliance audience.
-- NEVER mention points, scores, deductions, codes, percentages or the words "HIGH/MEDIUM/LOW".
-- Refer to obligations by their ID (e.g. ROB-00024947) and citations by section (e.g. 1026.13(b)(1)).
-- Support every statement with short quoted phrases from the vendor text and/or RegMap text.
-- State clearly what is covered, what is not covered, and the practical implication
-  for HSBC's obligation inventory.
-- Be specific and complete, but avoid repetition and filler.
+STEP D - WRITE THREE STAKEHOLDER FIELDS
+Write in formal, precise, professional English for a senior compliance audience.
+
+1. "summary": One paragraph stating whether and how the vendor obligation is reflected in RegMap,
+   naming the matched obligation ID(s) and citations, and characterising the overall alignment.
+
+2. "missing_in_regmap": Each requirement stated in the VENDOR obligation that is absent from, or
+   different in, the matched RegMap obligation(s). For EVERY item quote the vendor wording in double
+   quotes and state what RegMap says (quoted) or that RegMap is silent. One item per line, starting with "- ".
+   If nothing is missing write exactly: None identified.
+
+3. "missing_in_vendor": Each requirement stated in the matched REGMAP obligation(s) that is absent from,
+   or different in, the vendor obligation. For EVERY item quote the RegMap wording in double quotes,
+   name the RegMap obligation ID, and state what the vendor says (quoted) or that the vendor is silent.
+   One item per line, starting with "- ". If nothing is missing write exactly: None identified.
+
+RULES FOR THE THREE FIELDS
+- NEVER mention points, scores, deductions, codes, percentages, or HIGH/MEDIUM/LOW.
+- NEVER give recommendations, actions, next steps or suggestions. Describe the facts only.
+- Every gap must be supported by text in "double quotes" copied from the source.
+- Be specific and complete; avoid repetition and filler.
 
 STRICT RULES
 - Only use Obligation IDs from the list below. Never invent IDs.
-- If no RegMap obligation addresses the same requirement, return an empty matches list and explain
-  in the narrative that this appears to be a gap in the RegMap inventory.
+- If no RegMap obligation addresses the same requirement, return an empty matches list; in "summary"
+  state that no corresponding RegMap obligation was identified; in "missing_in_regmap" list the vendor
+  requirements with quotes; set "missing_in_vendor" to: None identified.
 
 VENDOR OBLIGATION
 Citation: {v['vendor_citation']}
@@ -97,115 +103,12 @@ Return ONLY valid JSON (no markdown) in exactly this shape:
       "obligation_id": "ROB-...",
       "deductions": [
         {{"code": "TIMING_MISSING", "evidence": "vendor: 'within 30 days'; RegMap: no deadline stated"}}
-      ],
-      "coverage_assessment": "2-4 sentences: what this RegMap obligation covers, where it falls short, with quoted evidence. No scores."
+      ]
     }}
   ],
-  "coverage_summary": "One paragraph: overall extent to which RegMap covers the vendor obligation and through which obligation(s).",
-  "gaps_not_covered_in_regmap": "Specific vendor requirements not reflected in any matched RegMap obligation, each with quoted evidence. Write 'None identified.' if fully covered.",
-  "additional_content_in_regmap": "Requirements in the matched RegMap obligations that go beyond the vendor obligation, with quoted evidence. Write 'None identified.' if none.",
-  "citation_alignment": "One or two sentences on whether the citations align, and whether any difference matters.",
-  "recommendation": "One sentence: e.g. no action required / enhance ROB-xxxx to reflect ... / consider creating a new obligation for ..."
+  "summary": "...",
+  "missing_in_regmap": "- Vendor requires \\"...\\"; RegMap ROB-... is silent on this.\\n- ...",
+  "missing_in_vendor": "- ROB-... requires \\"...\\"; the vendor obligation does not address this.\\n- ..."
 }}"""
 
-# Preview the instruction part for the first vendor row (RegMap list is long, so cut it)
-print(build_prompt(vd.iloc[0])[:3000])
-
-
-
-def clean_narrative(text):
-    """Remove any scoring/code language that slipped into stakeholder-facing text."""
-    if not isinstance(text, str):
-        return ""
-    t = text
-    # "-10 points", "(5 pts)", "+3 point"
-    t = re.sub(r"\(?\s*[-+]?\d+\s*(points?|pts)\s*\)?", "", t, flags=re.I)
-    # internal codes like TIMING_MISSING
-    t = re.sub(r"\b(" + "|".join(RUBRIC.keys()) + r")\b", "", t)
-    # scoring words
-    t = re.sub(r"\b(score[ds]?|deduct(ed|ion|ions)?)\b", "", t, flags=re.I)
-    # tidy leftover spacing/punctuation
-    t = re.sub(r"\s{2,}", " ", t).replace(" .", ".").replace(" ,", ",")
-    return t.strip()
-
-
-
-# ---------------- Score bands (tune if needed) ----------------
-def band(score):
-    """Convert a 0-100 score into a rating."""
-    if score >= 80: return "HIGH"
-    if score >= 50: return "MEDIUM"
-    if score >= 20: return "LOW"
-    return "NONE"
-
-MIN_SCORE = 20   # matches scoring below this are not treated as real matches
-
-
-def parse_json(txt):
-    """Strip ``` fences if the model added them, then convert text -> dict."""
-    txt = re.sub(r"^```(json)?", "", txt.strip())
-    txt = re.sub(r"```$", "", txt)
-    return json.loads(txt.strip())
-
-
-def score_match(m):
-    """
-    m = one match returned by the LLM.
-    1) keep only deduction codes that exist in RUBRIC
-    2) cap EXTRA_IN_REGMAP at 2 per match (so RegMap isn't over-penalised for being thorough)
-    3) score = 100 - sum of points, never below 0
-    """
-    clean, extra_count = [], 0
-    for d in m.get("deductions", []):
-        code = str(d.get("code", "")).strip().upper()
-        if code not in RUBRIC:
-            continue                                   # ignore unknown codes
-        if code == "EXTRA_IN_REGMAP":
-            extra_count += 1
-            if extra_count > 2:
-                continue                               # cap reached
-        clean.append({"code": code, "points": RUBRIC[code], "evidence": d.get("evidence", "")})
-
-    m["deductions"] = clean
-    m["score"] = max(0, 100 - sum(d["points"] for d in clean))
-    m["band"] = band(m["score"])
-    return m
-
-
-def compare_one(v, retries=3):
-    """Compare one vendor obligation against all RegMap obligations."""
-    prompt = build_prompt(v)
-
-    for attempt in range(retries):
-        raw = ai_chat(prompt)                          # your existing API function
-
-        # Case 1: gateway returned an error message -> wait and retry
-        if str(raw).startswith("API Error"):
-            print("   API error:", str(raw)[:150])
-            time.sleep(3 * (attempt + 1))              # 3s, 6s, 9s
-            continue
-
-        # Case 2: parse and score
-        try:
-            out = parse_json(raw)
-
-            matches = [m for m in out.get("matches", []) if m.get("obligation_id") in VALID_IDS]  # real IDs only
-            matches = [score_match(m) for m in matches]                                           # compute scores
-            matches = [m for m in matches if m["score"] >= MIN_SCORE]                             # drop weak ones
-
-            out["matches"] = sorted(matches, key=lambda m: m["score"], reverse=True)              # best first
-            out["best_score"] = out["matches"][0]["score"] if out["matches"] else 0
-            out["overall_similarity"] = band(out["best_score"])
-            return out
-
-        except Exception as e:
-            print("   Bad JSON, retrying:", e)
-
-    # All retries failed -> placeholder so the loop continues and every column still exists
-    return {"matches": [], "best_score": None, "overall_similarity": "ERROR",
-            "vendor_elements": [],
-            "coverage_summary": "The automated comparison could not be completed for this obligation; manual review required.",
-            "gaps_not_covered_in_regmap": "", "additional_content_in_regmap": "",
-            "citation_alignment": "", "recommendation": "Manual review required."}
-
-
+print(build_prompt(vd.iloc[0])[:3500])   # preview the instructions
