@@ -29,3 +29,26 @@ rm = (
 print("RegMap rows before:", len(df_regz_rsm2))
 print("Unique obligations after:", len(rm))
 rm.head(3)
+
+
+# Work on a copy of the 77-row filtered vendor table
+vd = vendor_obli_detail3.copy()
+
+# Build the full vendor citation, e.g. "1026.12" + "(d)(3)" -> "1026.12(d)(3)"
+vd["vendor_citation"] = (
+    vd["section_number"].astype(str).str.strip()                              # section part
+    + vd["obligationdetails_rules_rule_clause"].fillna("").astype(str).str.strip()  # clause part (empty if missing)
+)
+
+# Also clean the vendor summary text the same way as RegMap
+vd["obligationdetails_obligationsummary"] = (
+    vd["obligationdetails_obligationsummary"]
+    .astype(str)
+    .str.replace(r"\s+", " ", regex=True)
+    .str.strip()
+)
+
+# Eyeball the result: citations should look like 1026.12(d)(3)
+print("Vendor rows:", len(vd))
+vd[["obligationdetails_obligationuid", "vendor_citation", "obligationdetails_topic"]].head()
+
