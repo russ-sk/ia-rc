@@ -52,3 +52,28 @@ vd["obligationdetails_obligationsummary"] = (
 print("Vendor rows:", len(vd))
 vd[["obligationdetails_obligationuid", "vendor_citation", "obligationdetails_topic"]].head()
 
+
+# Build one text entry per RegMap obligation, like:
+#   [ROB-00024947] Citation: 1026.6(a)
+#   Title: Account Opening Disclosures: Open-End Credit...
+#   Text: The creditor must provide specific disclosures...
+entries = []
+for _, r in rm.iterrows():                  # loop over every RegMap obligation
+    entry = (
+        f"[{r['Obligation ID']}] Citation: {r['Obligation Citation']}\n"
+        f"Title: {r['Obligation Title']}\n"
+        f"Text: {r['Obligation Detailed Text']}"
+    )
+    entries.append(entry)
+
+# Join all entries with a blank line between them
+regmap_block = "\n\n".join(entries)
+
+# The set of real IDs. Used in Step 5 to reject made-up IDs.
+VALID_IDS = set(rm["Obligation ID"])
+
+# Size check: if this is huge (>400k characters) tell me, we'd add a pre-filter
+print("RegMap block size:", len(regmap_block), "characters")
+print(regmap_block[:600])   # preview the first couple of entries
+
+
