@@ -1,0 +1,112 @@
+# ------------------------------------------------------------------
+# DEDUCTION RUBRIC (internal only - never shown to stakeholders)
+# Every match starts at 100; each gap found costs these points.
+# Tune the numbers here without touching the prompt.
+# ------------------------------------------------------------------
+RUBRIC = {
+    "ACTOR_DIFFERENT":       15,
+    "ACTION_PARTIAL":        20,
+    "SCOPE_DIFFERENT":       10,
+    "CONDITION_MISSING":     10,
+    "TIMING_MISSING":        10,
+    "THRESHOLD_MISSING":     10,
+    "EXCEPTION_MISSING":      5,
+    "DETAIL_MISSING":         5,
+    "CITATION_SECTION_DIFF": 10,
+    "CITATION_CLAUSE_DIFF":   5,
+    "EXTRA_IN_REGMAP":        3,
+}
+
+# Plain-English meaning of each code, shown to the model so it picks the right one.
+# Note: the model sees the MEANINGS, not the point values.
+RUBRIC_MEANING = {
+    "ACTOR_DIFFERENT":       "the obligated party differs (e.g. card issuer vs creditor)",
+    "ACTION_PARTIAL":        "the core required or prohibited action is only partly covered",
+    "SCOPE_DIFFERENT":       "the product or account scope differs (e.g. open-end vs closed-end)",
+    "CONDITION_MISSING":     "a trigger or condition is absent",
+    "TIMING_MISSING":        "a deadline or timing requirement is absent or different",
+    "THRESHOLD_MISSING":     "a numeric amount or limit is absent or different",
+    "EXCEPTION_MISSING":     "an exception or exemption is absent",
+    "DETAIL_MISSING":        "a smaller element (form, method, content item) is absent",
+    "CITATION_SECTION_DIFF": "the citation points to a different section",
+    "CITATION_CLAUSE_DIFF":  "same section but a different or parent-level clause",
+    "EXTRA_IN_REGMAP":       "RegMap contains a requirement not present in the vendor text",
+}
+
+# Turn the meanings into readable lines for the prompt
+rubric_text = "\n".join(f"  {k}: {RUBRIC_MEANING[k]}" for k in RUBRIC)
+
+
+def build_prompt(v):
+    """
+    v = one row of the vendor table.
+    Returns the full prompt text for that vendor obligation.
+    {{ and }} are doubled because this is an f-string; they become { } in the prompt.
+    """
+    return f"""You are a senior US regulatory compliance analyst reviewing Regulation Z (Truth in Lending, 12 CFR 1026).
+Your written output will be read by senior compliance and risk stakeholders.
+
+TASK
+Compare ONE vendor-identified obligation against HSBC's internal RegMap obligations.
+Identify every RegMap obligation that addresses the SAME core requirement, assess how completely
+each one covers it, and explain the result in clear, professional language.
+
+STEP A - IDENTIFY CANDIDATES
+Only list a RegMap obligation if it addresses the same core requirement
+(same subject matter AND the same kind of duty or prohibition).
+A matching citation alone is not sufficient. A different citation does not rule a match out.
+
+STEP B - BREAK DOWN THE VENDOR OBLIGATION
+List its elements: obligated party, required/prohibited action, scope (products/accounts),
+conditions or triggers, timing, numeric thresholds, exceptions, other material details.
+
+STEP C - RECORD GAPS (for internal scoring only)
+For each vendor element a RegMap obligation does not cover, or covers differently, record ONE gap
+using one of these codes. Also record requirements present in RegMap but absent from the vendor text.
+{rubric_text}
+Each gap must include short quoted evidence. Record each distinct gap once only.
+If a RegMap obligation fully covers the vendor obligation, its gaps list is empty.
+
+STEP D - WRITE THE STAKEHOLDER NARRATIVE
+Write in formal, precise, professional English suitable for a senior compliance audience.
+- NEVER mention points, scores, deductions, codes, percentages or the words "HIGH/MEDIUM/LOW".
+- Refer to obligations by their ID (e.g. ROB-00024947) and citations by section (e.g. 1026.13(b)(1)).
+- Support every statement with short quoted phrases from the vendor text and/or RegMap text.
+- State clearly what is covered, what is not covered, and the practical implication
+  for HSBC's obligation inventory.
+- Be specific and complete, but avoid repetition and filler.
+
+STRICT RULES
+- Only use Obligation IDs from the list below. Never invent IDs.
+- If no RegMap obligation addresses the same requirement, return an empty matches list and explain
+  in the narrative that this appears to be a gap in the RegMap inventory.
+
+VENDOR OBLIGATION
+Citation: {v['vendor_citation']}
+Topic: {v['obligationdetails_topic']}
+Summary: {v['obligationdetails_obligationsummary']}
+
+REGMAP OBLIGATIONS
+{regmap_block}
+
+Return ONLY valid JSON (no markdown) in exactly this shape:
+{{
+  "vendor_elements": ["Obligated party: ...", "Action: ...", "Condition: ...", "Timing: ..."],
+  "matches": [
+    {{
+      "obligation_id": "ROB-...",
+      "deductions": [
+        {{"code": "TIMING_MISSING", "evidence": "vendor: 'within 30 days'; RegMap: no deadline stated"}}
+      ],
+      "coverage_assessment": "2-4 sentences: what this RegMap obligation covers, where it falls short, with quoted evidence. No scores."
+    }}
+  ],
+  "coverage_summary": "One paragraph: overall extent to which RegMap covers the vendor obligation and through which obligation(s).",
+  "gaps_not_covered_in_regmap": "Specific vendor requirements not reflected in any matched RegMap obligation, each with quoted evidence. Write 'None identified.' if fully covered.",
+  "additional_content_in_regmap": "Requirements in the matched RegMap obligations that go beyond the vendor obligation, with quoted evidence. Write 'None identified.' if none.",
+  "citation_alignment": "One or two sentences on whether the citations align, and whether any difference matters.",
+  "recommendation": "One sentence: e.g. no action required / enhance ROB-xxxx to reflect ... / consider creating a new obligation for ..."
+}}"""
+
+# Preview the instruction part for the first vendor row (RegMap list is long, so cut it)
+print(build_prompt(vd.iloc[0])[:3000])
