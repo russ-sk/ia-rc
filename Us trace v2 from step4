@@ -110,3 +110,21 @@ Return ONLY valid JSON (no markdown) in exactly this shape:
 
 # Preview the instruction part for the first vendor row (RegMap list is long, so cut it)
 print(build_prompt(vd.iloc[0])[:3000])
+
+
+
+def clean_narrative(text):
+    """Remove any scoring/code language that slipped into stakeholder-facing text."""
+    if not isinstance(text, str):
+        return ""
+    t = text
+    # "-10 points", "(5 pts)", "+3 point"
+    t = re.sub(r"\(?\s*[-+]?\d+\s*(points?|pts)\s*\)?", "", t, flags=re.I)
+    # internal codes like TIMING_MISSING
+    t = re.sub(r"\b(" + "|".join(RUBRIC.keys()) + r")\b", "", t)
+    # scoring words
+    t = re.sub(r"\b(score[ds]?|deduct(ed|ion|ions)?)\b", "", t, flags=re.I)
+    # tidy leftover spacing/punctuation
+    t = re.sub(r"\s{2,}", " ", t).replace(" .", ".").replace(" ,", ",")
+    return t.strip()
+
