@@ -128,3 +128,84 @@ def clean_narrative(text):
     t = re.sub(r"\s{2,}", " ", t).replace(" .", ".").replace(" ,", ",")
     return t.strip()
 
+
+
+# ---------------- Score bands (tune if needed) ----------------
+def band(score):
+    """Convert a 0-100 score into a rating."""
+    if score >= 80: return "HIGH"
+    if score >= 50: return "MEDIUM"
+    if score >= 20: return "LOW"
+    return "NONE"
+
+MIN_SCORE = 20   # matches scoring below this are not treated as real matches
+
+
+def parse_json(txt):
+    """Strip ``` fences if the model added them, then convert text -> dict."""
+    txt = re.sub(r"^```(json)?", "", txt.strip())
+    txt = re.sub(r"```$", "", txt)
+    return json.loads(txt.strip())
+
+
+def score_match(m):
+    """
+    m = one match returned by the LLM.
+    1) keep only deduction codes that exist in RUBRIC
+    2) cap EXTRA_IN_REGMAP at 2 per match (so RegMap isn't over-penalised for being thorough)
+    3) score = 100 - sum of points, never below 0
+    """
+    clean, extra_count = [], 0
+    for d in m.get("deductions", []):
+        code = str(d.get("code", "")).strip().upper()
+        if code not in RUBRIC:
+            continue                                   # ignore unknown codes
+        if code == "EXTRA_IN_REGMAP":
+            extra_count += 1
+            if extra_count > 2:
+                continue                               # cap reached
+        clean.append({"code": code, "points": RUBRIC[code], "evidence": d.get("evidence", "")})
+
+    m["deductions"] = clean
+    m["score"] = max(0, 100 - sum(d["points"] for d in clean))
+    m["band"] = band(m["score"])
+    return m
+
+
+def compare_one(v, retries=3):
+    """Compare one vendor obligation against all RegMap obligations."""
+    prompt = build_prompt(v)
+
+    for attempt in range(retries):
+        raw = ai_chat(prompt)                          # your existing API function
+
+        # Case 1: gateway returned an error message -> wait and retry
+        if str(raw).startswith("API Error"):
+            print("   API error:", str(raw)[:150])
+            time.sleep(3 * (attempt + 1))              # 3s, 6s, 9s
+            continue
+
+        # Case 2: parse and score
+        try:
+            out = parse_json(raw)
+
+            matches = [m for m in out.get("matches", []) if m.get("obligation_id") in VALID_IDS]  # real IDs only
+            matches = [score_match(m) for m in matches]                                           # compute scores
+            matches = [m for m in matches if m["score"] >= MIN_SCORE]                             # drop weak ones
+
+            out["matches"] = sorted(matches, key=lambda m: m["score"], reverse=True)              # best first
+            out["best_score"] = out["matches"][0]["score"] if out["matches"] else 0
+            out["overall_similarity"] = band(out["best_score"])
+            return out
+
+        except Exception as e:
+            print("   Bad JSON, retrying:", e)
+
+    # All retries failed -> placeholder so the loop continues and every column still exists
+    return {"matches": [], "best_score": None, "overall_similarity": "ERROR",
+            "vendor_elements": [],
+            "coverage_summary": "The automated comparison could not be completed for this obligation; manual review required.",
+            "gaps_not_covered_in_regmap": "", "additional_content_in_regmap": "",
+            "citation_alignment": "", "recommendation": "Manual review required."}
+
+
