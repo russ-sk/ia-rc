@@ -112,3 +112,71 @@ Return ONLY valid JSON (no markdown) in exactly this shape:
 }}"""
 
 print(build_prompt(vd.iloc[0])[:3500])   # preview the instructions
+
+
+
+
+# ---------------- Score bands ----------------
+def band(score):
+    if score >= 80: return "HIGH"
+    if score >= 50: return "MEDIUM"
+    if score >= 20: return "LOW"
+    return "NONE"
+
+MIN_SCORE = 20   # matches below this are not treated as real matches
+
+
+def parse_json(txt):
+    """Strip ``` fences if present, then convert text -> dict."""
+    txt = re.sub(r"^```(json)?", "", txt.strip())
+    txt = re.sub(r"```$", "", txt)
+    return json.loads(txt.strip())
+
+
+def score_match(m):
+    """Keep valid codes, cap EXTRA_IN_REGMAP at 2, score = 100 - points (min 0)."""
+    clean, extra_count = [], 0
+    for d in m.get("deductions", []):
+        code = str(d.get("code", "")).strip().upper()
+        if code not in RUBRIC:
+            continue
+        if code == "EXTRA_IN_REGMAP":
+            extra_count += 1
+            if extra_count > 2:
+                continue
+        clean.append({"code": code, "points": RUBRIC[code], "evidence": d.get("evidence", "")})
+    m["deductions"] = clean
+    m["score"] = max(0, 100 - sum(d["points"] for d in clean))
+    m["band"] = band(m["score"])
+    return m
+
+
+def compare_one(v, retries=3):
+    """Compare one vendor obligation against all RegMap obligations."""
+    prompt = build_prompt(v)
+
+    for attempt in range(retries):
+        raw = ai_chat(prompt)                           # your existing API function
+
+        if str(raw).startswith("API Error"):            # gateway error -> wait and retry
+            print("   API error:", str(raw)[:150])
+            time.sleep(3 * (attempt + 1))
+            continue
+
+        try:
+            out = parse_json(raw)
+            matches = [m for m in out.get("matches", []) if m.get("obligation_id") in VALID_IDS]  # real IDs only
+            matches = [score_match(m) for m in matches]                                           # compute scores
+            matches = [m for m in matches if m["score"] >= MIN_SCORE]                             # drop weak ones
+            out["matches"] = sorted(matches, key=lambda m: m["score"], reverse=True)              # best first
+            out["best_score"] = out["matches"][0]["score"] if out["matches"] else 0
+            out["overall_similarity"] = band(out["best_score"])
+            return out
+        except Exception as e:
+            print("   Bad JSON, retrying:", e)
+
+    # All retries failed -> placeholder so every column still exists
+    return {"matches": [], "best_score": None, "overall_similarity": "ERROR", "vendor_elements": [],
+            "summary": "The automated comparison could not be completed for this obligation; manual review required.",
+            "missing_in_regmap": "", "missing_in_vendor": ""}
+
