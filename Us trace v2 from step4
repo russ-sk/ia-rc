@@ -180,3 +180,20 @@ def compare_one(v, retries=3):
             "summary": "The automated comparison could not be completed for this obligation; manual review required.",
             "missing_in_regmap": "", "missing_in_vendor": ""}
 
+
+for _, v in vd.head(2).iterrows():
+    print("VENDOR:", v["obligationdetails_obligationuid"], "|", v["vendor_citation"])
+    res = compare_one(v)
+
+    print("Best score:", res["best_score"], "| Rating:", res["overall_similarity"])
+    for m in res["matches"]:                                   # internal scoring trail
+        print(f"  {m['obligation_id']} = {m['score']}")
+        for d in m["deductions"]:
+            print(f"     -{d['points']} {d['code']}: {d['evidence']}")
+
+    print("\nSUMMARY:\n", clean_narrative(res.get("summary", "")))
+    print("\nMISSING IN REGMAP:\n", clean_narrative(res.get("missing_in_regmap", "")))
+    print("\nMISSING IN VENDOR:\n", clean_narrative(res.get("missing_in_vendor", "")))
+    print("-" * 100)
+
+
