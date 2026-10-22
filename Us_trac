@@ -76,6 +76,42 @@ VALID_IDS = set(rm["Obligation ID"])
 print("RegMap block size:", len(regmap_block), "characters")
 print(regmap_block[:600])   # preview the first couple of entries
 
+rows = []
+for _, v in vd.iterrows():
+    uid = v["obligationdetails_obligationuid"]
+    r = results.get(uid, {})                 # the LLM answer for this vendor obligation
+    matches = r.get("matches", [])           # list of matched RegMap obligations (already ID-validated in Step 5)
+
+    rows.append({
+        # --- vendor side ---
+        "vendor_obligation_uid": uid,
+        "vendor_citation":       v["vendor_citation"],
+        "vendor_topic":          v["obligationdetails_topic"],
+        "vendor_summary":        v["obligationdetails_obligationsummary"],
+
+        # --- matched RegMap side ---
+        # e.g. "ROB-00024947, ROB-00024951"  or "NONE"
+        "regmap_obligation_ids": ", ".join(m["obligation_id"] for m in matches) or "NONE",
+        # e.g. "ROB-00024947 (HIGH); ROB-00024951 (LOW)"
+        "match_detail":          "; ".join(f"{m['obligation_id']} ({m['similarity']})" for m in matches),
+
+        # If nothing valid matched -> NONE, but keep ERROR visible if the call failed
+        "overall_similarity":    r.get("overall_similarity", "NONE") if matches
+                                 else ("ERROR" if r.get("overall_similarity") == "ERROR" else "NONE"),
+
+        # --- gaps + evidence ---
+        "missing_in_regmap":     r.get("missing_in_regmap", ""),   # vendor says it, RegMap doesn't
+        "extra_in_regmap":       r.get("extra_in_regmap", ""),     # RegMap says it, vendor doesn't
+        "reasoning":             r.get("reasoning", ""),
+    })
+
+comparison_df = pd.DataFrame(rows)
+
+# Summary: how many HIGH / MEDIUM / LOW / NONE / ERROR
+print(comparison_df["overall_similarity"].value_counts())
+comparison_df.head()
+
+
 
 
 def build_prompt(v):
