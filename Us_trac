@@ -175,4 +175,50 @@ def compare_one(v, retries=3):
 
 
 
+# tqdm draws the progress bar. "tqdm.auto" picks the best style for Jupyter.
+# If it's not installed, run once:  !pip install tqdm
+from tqdm.auto import tqdm
+
+# Create the results store only if it doesn't exist yet,
+# so re-running this cell keeps the progress already made.
+if "results" not in globals():
+    results = {}
+
+# Work out which vendor rows still need to be processed:
+# rows never done, or rows that ended in ERROR last time.
+todo = vd[
+    vd["obligationdetails_obligationuid"].map(
+        lambda uid: uid not in results or results[uid]["overall_similarity"] == "ERROR"
+    )
+]
+print(f"Already done: {len(vd) - len(todo)} | To process now: {len(todo)}")
+
+# Wrap the loop in tqdm -> this is what draws the bar.
+#   total = number of rows, so the bar knows what 100% is
+#   desc  = label shown on the left of the bar
+pbar = tqdm(todo.iterrows(), total=len(todo), desc="Comparing obligations")
+
+errors = 0
+for _, v in pbar:
+    uid = v["obligationdetails_obligationuid"]
+
+    # Show the current vendor ID and error count on the right of the bar
+    pbar.set_postfix({"current": uid[-12:], "errors": errors})
+
+    # Call the LLM (Step 5 function) and store the answer under the vendor ID
+    results[uid] = compare_one(v)
+
+    # Count failures so you can see them live on the bar
+    if results[uid]["overall_similarity"] == "ERROR":
+        errors += 1
+
+# Final summary after the loop
+total_errors = sum(1 for r in results.values() if r["overall_similarity"] == "ERROR")
+print(f"Done. {len(results)} processed, {total_errors} errors")
+if total_errors:
+    print("Re-run this cell to retry only the failed rows.")
+
+
+
+
 
