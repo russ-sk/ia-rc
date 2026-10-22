@@ -1,0 +1,31 @@
+# Work on a copy so the original df_regz_rsm2 stays untouched
+rm = df_regz_rsm2.copy()
+
+# --- 1a. Clean the three text columns ---
+for col in ["Obligation Title", "Obligation Detailed Text", "Obligation Citation"]:
+    rm[col] = (
+        rm[col]
+        .astype(str)                                     # make sure everything is text (NaN -> "nan")
+        .str.replace(r"\\n|\n", " ", regex=True)         # replace both literal "\n" and real line breaks with a space
+        .str.replace(r"\s+", " ", regex=True)            # collapse multiple spaces into one
+        .str.strip()                                     # remove spaces at the start/end
+    )
+
+# --- 1b. Collapse duplicates: one row per Obligation ID ---
+# groupby("Obligation ID") puts all rows with the same ID together.
+# .agg() says how to combine each column inside that group:
+#   "first"  -> just take the first value (title/text are identical across duplicates)
+#   lambda   -> for citation, join all DIFFERENT citations with " | " in case one obligation has several
+rm = (
+    rm.groupby("Obligation ID", as_index=False)
+      .agg({
+          "Obligation Title":         "first",
+          "Obligation Detailed Text": "first",
+          "Obligation Citation":      lambda s: " | ".join(sorted(set(s))),
+      })
+)
+
+# Show how much duplication we removed
+print("RegMap rows before:", len(df_regz_rsm2))
+print("Unique obligations after:", len(rm))
+rm.head(3)
