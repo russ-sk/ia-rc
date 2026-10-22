@@ -129,3 +129,50 @@ print(build_prompt(vd.iloc[0])[:1500])
 
 
 
+def parse_json(txt):
+    """Clean the LLM's reply and convert it to a Python dict."""
+    txt = txt.strip()
+    txt = re.sub(r"^```(json)?", "", txt)   # remove opening ``` or ```json if present
+    txt = re.sub(r"```$", "", txt)          # remove closing ``` if present
+    return json.loads(txt.strip())          # text -> dictionary (raises error if invalid)
+
+
+def compare_one(v, retries=3):
+    """Compare one vendor obligation against all RegMap obligations."""
+    prompt = build_prompt(v)
+
+    for attempt in range(retries):                 # try up to 3 times
+        raw = ai_chat(prompt)                      # <-- your existing API function
+
+        # Case 1: the gateway returned an error message instead of an answer
+        if str(raw).startswith("API Error"):
+            print("   API error:", str(raw)[:150])
+            time.sleep(3 * (attempt + 1))          # wait 3s, then 6s, then 9s
+            continue
+
+        # Case 2: try to read the JSON
+        try:
+            out = parse_json(raw)
+
+            # Case 3: drop any obligation ID that is not really in RegMap
+            out["matches"] = [
+                m for m in out.get("matches", [])
+                if m.get("obligation_id") in VALID_IDS
+            ]
+            return out                             # success -> stop here
+
+        except Exception as e:
+            print("   Bad JSON, retrying:", e)
+
+    # All retries failed -> return a placeholder so the loop continues
+    return {
+        "matches": [],
+        "overall_similarity": "ERROR",
+        "missing_in_regmap": "",
+        "extra_in_regmap": "",
+        "reasoning": "failed after retries",
+    }
+
+
+
+
