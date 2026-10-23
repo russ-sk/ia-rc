@@ -1,0 +1,49 @@
+rm = df_regz_rsm2.copy()
+
+# Clean text columns: remove literal "\n" and real line breaks, collapse spaces
+for col in ["Obligation Title", "Obligation Detailed Text", "Obligation Citation"]:
+    rm[col] = (rm[col].astype(str)
+                      .str.replace(r"\\n|\n", " ", regex=True)
+                      .str.replace(r"\s+", " ", regex=True)
+                      .str.strip())
+
+# One row per Obligation ID; if an obligation has several citations, join them with " | "
+rm = (rm.groupby("Obligation ID", as_index=False)
+        .agg({"Obligation Title":         "first",
+              "Obligation Detailed Text": "first",
+              "Obligation Citation":      lambda s: " | ".join(sorted(set(s)))}))
+
+print("RegMap rows:", len(df_regz_rsm2), "-> unique obligations:", len(rm))
+rm.head(3)
+
+
+vd = vendor_obli_detail3.copy()
+
+# Full vendor citation, e.g. "1026.12" + "(d)(3)" -> "1026.12(d)(3)"
+vd["vendor_citation"] = (vd["section_number"].astype(str).str.strip()
+                         + vd["obligationdetails_rules_rule_clause"].fillna("").astype(str).str.strip())
+
+# Clean the vendor summary text
+vd["obligationdetails_obligationsummary"] = (vd["obligationdetails_obligationsummary"].astype(str)
+                                             .str.replace(r"\s+", " ", regex=True).str.strip())
+
+# Lookups used later to build the output columns
+VENDOR_CITATION = dict(zip(vd["obligationdetails_obligationuid"], vd["vendor_citation"]))
+VENDOR_SUMMARY  = dict(zip(vd["obligationdetails_obligationuid"], vd["obligationdetails_obligationsummary"]))
+VALID_VENDOR_IDS = set(vd["obligationdetails_obligationuid"])
+
+print("Vendor obligations:", len(vd))
+vd[["obligationdetails_obligationuid", "vendor_citation", "obligationdetails_topic"]].head()
+
+
+vendor_block = "\n\n".join(
+    f"[{v['obligationdetails_obligationuid']}] Citation: {v['vendor_citation']}\n"
+    f"Topic: {v['obligationdetails_topic']}\n"
+    f"Summary: {v['obligationdetails_obligationsummary']}"
+    for _, v in vd.iterrows()
+)
+print("Vendor block size:", len(vendor_block), "characters")
+print(vendor_block[:600])
+
+
+
