@@ -200,3 +200,88 @@ for _, o in rm.head(2).iterrows():
     print("-" * 100)
 
 
+
+# Format changed -> start fresh ONCE. After the first full run, comment this out so re-runs resume.
+results_rev = {}
+
+todo = rm[rm["Obligation ID"].map(
+    lambda oid: oid not in results_rev or results_rev[oid]["coverage_status"] == "ERROR")]
+print(f"Already done: {len(rm) - len(todo)} | To process now: {len(todo)}")
+
+pbar = tqdm(todo.iterrows(), total=len(todo), desc="RegMap -> Vendor")
+errors = 0
+for _, o in pbar:
+    oid = o["Obligation ID"]
+    pbar.set_postfix({"current": oid, "errors": errors})
+    results_rev[oid] = compare_one(o)
+    if results_rev[oid]["coverage_status"] == "ERROR":
+        errors += 1
+
+total_errors = sum(1 for r in results_rev.values() if r["coverage_status"] == "ERROR")
+print(f"Done. {len(results_rev)} processed, {total_errors} errors")
+
+
+
+
+rows = []
+for _, o in rm.iterrows():
+    oid = o["Obligation ID"]
+    r = results_rev.get(oid, {})
+    ids = r.get("covering_vendor_ids", [])
+
+    rows.append({
+        "RegMap ID":                        oid,
+        # Title and Detailed Text combined
+        "RegMap Obligation":                f"{o['Obligation Title']} - {o['Obligation Detailed Text']}",
+        # Comma-separated vendor IDs
+        "Covering Vendor Obligation ID(s)": ", ".join(ids) if ids else "No direct vendor obligation",
+        # One bullet per vendor obligation: "• <id> - <exact vendor text>"
+        "Vendor Coverage Text":             format_coverage_text(ids, r.get("nearest_thematic", "")),
+        # One bullet per gap, each with quoted evidence
+        "Gaps / Differences":               format_gaps(r.get("gaps", [])),
+        # Helper for colouring only (not exported)
+        "Coverage Status":                  str(r.get("coverage_status", "ERROR")).title(),
+    })
+
+regmap_vs_vendor_df = pd.DataFrame(rows)
+
+print(regmap_vs_vendor_df["Coverage Status"].value_counts())
+regmap_vs_vendor_df.head()
+
+
+
+from openpyxl.styles import PatternFill, Font, Alignment
+
+OUT_FILE = "RegZ - Analytics Results.xlsx"
+SHEET    = "HSBC OBL vs Vendor OBL"
+
+export_df = regmap_vs_vendor_df.drop(columns=["Coverage Status"])   # helper column not exported
+
+with pd.ExcelWriter(OUT_FILE, engine="openpyxl") as writer:
+    export_df.to_excel(writer, sheet_name=SHEET, index=False)
+    ws = writer.sheets[SHEET]
+
+    # Column widths: A=ROB ID, B=RegMap obligation, C=vendor IDs, D=vendor text, E=gaps
+    for col, width in zip("ABCDE", [18, 60, 35, 70, 75]):
+        ws.column_dimensions[col].width = width
+
+    header_fill = PatternFill("solid", fgColor="DDEBF7")   # light blue header
+    red_fill    = PatternFill("solid", fgColor="E8462A")   # uncovered rows
+    wrap_top    = Alignment(wrap_text=True, vertical="top")
+
+    for cell in ws[1]:                                     # header styling
+        cell.fill, cell.font, cell.alignment = header_fill, Font(bold=True), wrap_top
+
+    statuses = regmap_vs_vendor_df["Coverage Status"].tolist()
+    for i, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row)):
+        for cell in row:
+            cell.alignment = wrap_top                      # wrap so bullets show on separate lines
+            if statuses[i] == "None":
+                cell.fill = red_fill                       # red where no vendor coverage
+
+    ws.freeze_panes = "A2"
+
+print("Saved:", OUT_FILE)
+
+
+
