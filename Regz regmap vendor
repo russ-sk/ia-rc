@@ -54,37 +54,43 @@ Your output will be read by senior compliance and risk stakeholders.
 TASK
 Assess whether ONE HSBC RegMap obligation is covered by the vendor-identified obligations listed below.
 
-HOW TO IDENTIFY COVERING VENDOR OBLIGATIONS
-- A vendor obligation "covers" the RegMap obligation if it addresses the same core requirement
-  (same subject matter AND the same kind of duty or prohibition), fully or in part.
-- Vendors often split one rule across several rows. List EVERY vendor obligation that covers any part
-  of the RegMap obligation, in citation order.
-- Judge mainly on the meaning of the text. Use citations as supporting evidence only: a matching
-  citation alone is not sufficient, and a different citation does not rule a match out.
+WHICH VENDOR OBLIGATIONS COUNT AS "COVERING" (be strict)
+Include a vendor obligation ONLY if it states a requirement that forms part of THIS RegMap obligation.
+Vendors often split one rule across several rows - include every such row - but EXCLUDE:
+  - general, definitional or framework rules that merely apply to many obligations
+    (e.g. general disclosure form/timing rules) unless the RegMap text itself contains that requirement;
+  - rows whose scope differs (e.g. RegMap is home-secured open-end credit, vendor row is
+    non-home-secured or closed-end) - these are NOT covering;
+  - rows that are only thematically related.
+Judge mainly on the meaning of the text. Citations are supporting evidence only: a matching citation
+alone is not sufficient, and a different citation does not rule a match out.
 
 COVERAGE STATUS
-  FULL    = all material elements of the RegMap obligation are covered by the vendor obligation(s)
+  FULL    = all material elements of the RegMap obligation are covered
   PARTIAL = the core requirement is covered but one or more material elements are missing or different
   NONE    = no vendor obligation addresses the core requirement
 
-HOW TO WRITE "gaps_differences"
-Formal, concise, professional prose (2-5 sentences), in the style of:
-  "Core individual limit and the 15% unsecured plus additional 10% secured limits are covered.
-   The vendor rows distribute the rule across three obligations rather than one consolidated statement."
-- First state what is covered, then what is missing or different. Material elements to check:
-  obligated party, required/prohibited action, scope, conditions/triggers, timing, numeric thresholds,
-  exceptions, and other material details.
-- Quote short key phrases in double quotes where they make a gap precise.
-- Mention citations where relevant (RegMap citation vs vendor citations).
-- Note structural differences (e.g. one RegMap obligation spread across several vendor rows).
-- Also note material requirements the vendor states that RegMap does not.
-- If FULL with nothing missing, begin with: "No material content gap identified;" then say why.
-- If NONE, begin with: "No vendor obligation addresses" and list the missing requirements.
+GAPS / DIFFERENCES
+Return a list of separate points. Check: obligated party, required/prohibited action, scope,
+conditions/triggers, timing, numeric thresholds, exceptions, other material details.
+Each point has:
+  "type": one of
+     "Covered"           - one point only, summarising what the vendor obligations do cover
+     "Missing in Vendor" - a RegMap requirement absent from / different in the vendor obligations
+     "Missing in RegMap" - a material vendor requirement absent from the RegMap text
+     "Structural"        - e.g. one RegMap obligation distributed across several vendor rows
+  "point":    one professional sentence describing it
+  "evidence": the supporting wording in double quotes, naming its source and citation, e.g.
+     RegMap (1026.6(a)) states "..." ; vendor ecfr....a.2 (1026.6(a)(2)) states "..." / is silent.
+Rules:
+- Always start with one "Covered" point (or, if status is NONE, a "Missing in Vendor" point).
+- If nothing is missing, the only points are "Covered" (and "Structural" if relevant).
+- Every Missing point MUST have quoted evidence.
 - NEVER give recommendations, next steps or suggestions. NEVER mention scores or ratings.
 
 IF STATUS IS NONE
-Fill "nearest_thematic" with one sentence naming the closest related vendor rules and their citations,
-e.g. "Nearest thematic vendor rules concern insider lending limits (1026.x(y)) but do not address ..."
+Fill "nearest_thematic" with one sentence naming the closest related vendor rules with citations, e.g.
+"Nearest thematic vendor rules concern ... (1026.x(y)) but do not address ..."
 Leave "covering_vendor_ids" empty.
 
 STRICT RULES
@@ -103,11 +109,14 @@ Return ONLY valid JSON (no markdown) in exactly this shape:
 {{
   "covering_vendor_ids": ["ecfr....", "ecfr...."],
   "coverage_status": "FULL|PARTIAL|NONE",
-  "gaps_differences": "...",
+  "gaps": [
+    {{"type": "Covered", "point": "...", "evidence": "..."}},
+    {{"type": "Missing in Vendor", "point": "...", "evidence": "RegMap (1026.x) states \\"...\\"; the vendor obligations are silent."}}
+  ],
   "nearest_thematic": ""
 }}"""
 
-print(build_prompt(rm.iloc[0])[:3000])   # preview
+print(build_prompt(rm.iloc[0])[:3500])   # preview
 
 
 
@@ -117,16 +126,17 @@ def parse_json(txt):
     txt = re.sub(r"```$", "", txt)
     return json.loads(txt.strip())
 
+ALLOWED_GAP_TYPES = ["Covered", "Structural", "Missing in Vendor", "Missing in RegMap"]  # also the display order
+
 
 def compare_one(o, retries=3):
     """Assess vendor coverage for one RegMap obligation."""
     prompt = build_prompt(o)
 
     for attempt in range(retries):
-        raw = ai_chat(prompt)                                   # your existing API function
+        raw = ai_chat(prompt)                                    # your existing API function
 
-        # Gateway error -> wait and retry
-        if str(raw).startswith("API Error"):
+        if str(raw).startswith("API Error"):                     # gateway error -> wait and retry
             print("   API error:", str(raw)[:150])
             time.sleep(3 * (attempt + 1))
             continue
@@ -134,41 +144,59 @@ def compare_one(o, retries=3):
         try:
             out = parse_json(raw)
 
-            # Keep only real vendor IDs, no duplicates, sorted by vendor citation
+            # 1) Covering IDs: real IDs only, no duplicates, ordered by vendor citation
             ids = [i for i in dict.fromkeys(out.get("covering_vendor_ids", [])) if i in VALID_VENDOR_IDS]
             out["covering_vendor_ids"] = sorted(ids, key=lambda i: VENDOR_CITATION.get(i, ""))
 
-            # Normalise status; if no valid IDs remain, it can only be NONE
+            # 2) Status consistent with IDs
             status = str(out.get("coverage_status", "")).strip().upper()
             if not ids:
                 status = "NONE"
             elif status not in ("FULL", "PARTIAL"):
                 status = "PARTIAL"
             out["coverage_status"] = status
+
+            # 3) Gaps: keep well-formed items with a known type, sorted in display order
+            gaps = [g for g in out.get("gaps", [])
+                    if isinstance(g, dict) and g.get("type") in ALLOWED_GAP_TYPES and g.get("point")]
+            out["gaps"] = sorted(gaps, key=lambda g: ALLOWED_GAP_TYPES.index(g["type"]))
             return out
 
         except Exception as e:
             print("   Bad JSON, retrying:", e)
 
     # All retries failed -> placeholder so the loop keeps going
-    return {"covering_vendor_ids": [], "coverage_status": "ERROR",
-            "gaps_differences": "Automated assessment could not be completed; manual review required.",
-            "nearest_thematic": ""}
+    return {"covering_vendor_ids": [], "coverage_status": "ERROR", "nearest_thematic": "",
+            "gaps": [{"type": "Missing in Vendor",
+                      "point": "Automated assessment could not be completed; manual review required.",
+                      "evidence": ""}]}
 
 
+def format_coverage_text(ids, nearest=""):
+    """'• <vendor id> - <exact vendor text>' per covering vendor obligation, one per line."""
+    if not ids:
+        return nearest or "No related vendor obligation identified."
+    return "\n".join(f"• {i} - {VENDOR_SUMMARY[i]}" for i in ids)
+
+
+def format_gaps(gaps):
+    """'• <Type>: <point> Evidence: <quoted evidence>' per gap, one per line."""
+    lines = []
+    for g in gaps:
+        line = f"• {g['type']}: {g['point'].strip()}"
+        if g.get("evidence"):
+            line += f" Evidence: {g['evidence'].strip()}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# ---- Test on 2 RegMap obligations ----
 for _, o in rm.head(2).iterrows():
-    print("REGMAP:", o["Obligation ID"], "|", o["Obligation Citation"], "|", o["Obligation Title"])
     res = compare_one(o)
-    print("Status:", res["coverage_status"])
-    for vid in res["covering_vendor_ids"]:
-        print(f"   {vid}  [{VENDOR_CITATION[vid]}]")
-    print("Gaps / Differences:\n ", res["gaps_differences"])
-    if res.get("nearest_thematic"):
-        print("Nearest thematic:\n ", res["nearest_thematic"])
+    print("REGMAP:", o["Obligation ID"], "|", o["Obligation Citation"], "| Status:", res["coverage_status"])
+    print("\nCovering Vendor Obligation ID(s):\n ", ", ".join(res["covering_vendor_ids"]) or "No direct vendor obligation")
+    print("\nVendor Coverage Text:\n" + format_coverage_text(res["covering_vendor_ids"], res.get("nearest_thematic", "")))
+    print("\nGaps / Differences:\n" + format_gaps(res["gaps"]))
     print("-" * 100)
-
-
-
-
 
 
