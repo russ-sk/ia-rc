@@ -127,3 +127,28 @@ print(rm[["Obligation ID", "Obligation Citation", "citation_list"]])
 # Confirm results_rev was produced by the citation-level code (Step 7 onwards)
 missing_cov = [oid for oid, r in results_rev.items() if "citation_coverage" not in r]
 print("Obligations without per-citation results:", len(missing_cov))
+
+
+import re
+
+# Matches a CFR section with any clause chain, e.g. 229.13, 229.19(e), 1026.6(a)(1)(ii)
+CITE_PATTERN = r"\d{3,4}\.\d+[a-z]?(?:\([A-Za-z0-9]+\))*"
+
+
+def extract_citations(text):
+    """'12 CFR 229.13 12 CFR 229.19(e)' -> ['229.13', '229.19(e)']"""
+    t = str(text)
+    t = re.sub(r"\b\d+\s*CFR\b", " ", t, flags=re.I)   # drop "12 CFR"
+    t = t.replace("§", " ").replace("Section", " ")
+    t = re.sub(r"\s+(?=\()", "", t)                     # "229.19 (e)" -> "229.19(e)"
+    return list(dict.fromkeys(re.findall(CITE_PATTERN, t)))
+
+
+def related(vendor_cite, regmap_cite):
+    """True if the two citations sit on the same branch, e.g. 229.19(e)(1) under 229.19(e)."""
+    v, r = vendor_cite, regmap_cite
+    return v == r or v.startswith(r + "(") or r.startswith(v + "(")
+
+
+print(extract_citations("12 CFR 229.13 12 CFR 229.19(e)"))   # should print ['229.13', '229.19(e)']
+
