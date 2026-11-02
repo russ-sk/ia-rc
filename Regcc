@@ -1,0 +1,118 @@
+rob_rows = []
+for _, o in rm.iterrows():
+    oid = o["Obligation ID"]
+    r   = results_rev.get(oid, {})
+    ids = r.get("covering_vendor_ids", [])
+    cov = r.get("citation_coverage", [])
+
+    # Citations not fully covered, e.g. "229.19(e), 229.13(b) (partially covered)"
+    missing = [c["regmap_citation"] + (" (partially covered)" if c["status"] == "PARTIALLY COVERED" else "")
+               for c in cov if c["status"] != "COVERED"]
+
+    rob_rows.append({
+        "RegMap ID":                        oid,
+        "RegMap Obligation":                f"{o['Obligation Title']} - {o['Obligation Detailed Text']}",
+        "RegMap Citation(s)":               ", ".join(o["citation_list"]) or o["Obligation Citation"],
+        "Covering Vendor Obligation ID(s)": ", ".join(ids) if ids else "No direct vendor obligation",
+        "Vendor Coverage Text":             format_coverage_text(ids, r.get("nearest_thematic", "")),
+        "Missing Citation(s)":              ", ".join(missing) if missing else "None",
+        "Gaps / Differences":               format_gaps(r.get("gaps", [])),
+        # helper for colouring only (not exported)
+        "_status":                          str(r.get("coverage_status", "ERROR")).title(),
+    })
+
+rob_level_df = pd.DataFrame(rob_rows)
+
+print(rob_level_df["_status"].value_counts(), "\n")
+print("ROBs with at least one missing citation:", (rob_level_df["Missing Citation(s)"] != "None").sum())
+rob_level_df.head()
+
+
+cite_rows = []
+for _, o in rm.iterrows():
+    oid = o["Obligation ID"]
+    r   = results_rev.get(oid, {})
+    cov = r.get("citation_coverage", [])
+
+    # RegMap obligations with no parsable citation still get one row
+    if not cov:
+        cov = [{"regmap_citation": o["Obligation Citation"] or "No citation provided",
+                "status": "NOT COVERED" if not r.get("covering_vendor_ids") else "PARTIALLY COVERED",
+                "covering_vendor_ids": r.get("covering_vendor_ids", []),
+                "evidence": "No citation provided in RegMap; assessed at obligation level."}]
+
+    for c in cov:
+        ids = c["covering_vendor_ids"]
+        label = CITE_LABEL[c["status"]]                 # Covered / Partially covered / Not covered
+
+        cite_rows.append({
+            "RegMap ID":                        oid,
+            "RegMap Obligation":                f"{o['Obligation Title']} - {o['Obligation Detailed Text']}",
+            "RegMap Citation":                  c["regmap_citation"],
+            "Covering Vendor Obligation ID(s)": ", ".join(ids) if ids else "No vendor obligation covers this citation",
+            "Vendor Coverage Text":             format_coverage_text(ids) if ids
+                                                else "No vendor obligation covers this citation.",
+            # One bullet stating the outcome + quoted evidence for this citation
+            "Gaps / Differences":               f"• {label}: {c.get('evidence', '').strip()}",
+            # helper for colouring only (not exported)
+            "_status":                          c["status"],
+        })
+
+citation_level_df = pd.DataFrame(cite_rows)
+
+print("Rows (ROB x citation):", len(citation_level_df))
+print(citation_level_df["_status"].value_counts())
+citation_level_df.head()
+
+
+from openpyxl.styles import PatternFill, Font, Alignment
+
+HEADER_FILL = PatternFill("solid", fgColor="DDEBF7")   # light blue
+RED_FILL    = PatternFill("solid", fgColor="E8462A")   # missing
+AMBER_FILL  = PatternFill("solid", fgColor="FFE699")   # partial
+WRAP_TOP    = Alignment(wrap_text=True, vertical="top")
+
+
+def write_sheet(writer, df, sheet, widths, fills):
+    """
+    df     : table to export (helper column '_status' is dropped)
+    widths : column widths in order
+    fills  : list with one fill (or None) per data row
+    """
+    df.drop(columns=["_status"]).to_excel(writer, sheet_name=sheet, index=False)
+    ws = writer.sheets[sheet]
+
+    for i, w in enumerate(widths):                     # column widths
+        ws.column_dimensions[chr(65 + i)].width = w
+
+    for cell in ws[1]:                                 # header row
+        cell.fill, cell.font, cell.alignment = HEADER_FILL, Font(bold=True), WRAP_TOP
+
+    for row, fill in zip(ws.iter_rows(min_row=2, max_row=ws.max_row), fills):
+        for cell in row:
+            cell.alignment = WRAP_TOP                  # wrap so bullets show on separate lines
+            if fill:
+                cell.fill = fill
+
+    ws.freeze_panes = "A2"
+
+
+# ---- Row colours ----
+rob_fills = [RED_FILL if s == "None" else (AMBER_FILL if m != "None" else None)
+             for s, m in zip(rob_level_df["_status"], rob_level_df["Missing Citation(s)"])]
+
+cite_fills = [{"NOT COVERED": RED_FILL, "PARTIALLY COVERED": AMBER_FILL}.get(s)
+              for s in citation_level_df["_status"]]
+
+# ---- Write both sheets ----
+with pd.ExcelWriter(OUT_FILE, engine="openpyxl") as writer:
+    # A=ROB, B=obligation, C=citations, D=vendor IDs, E=vendor text, F=missing citations, G=gaps
+    write_sheet(writer, rob_level_df, "ROB Level",
+                widths=[18, 60, 22, 35, 70, 28, 75], fills=rob_fills)
+
+    # A=ROB, B=obligation, C=citation, D=vendor IDs, E=vendor text, F=gaps
+    write_sheet(writer, citation_level_df, "ROB x Citation Level",
+                widths=[18, 60, 16, 35, 70, 75], fills=cite_fills)
+
+print("Saved:", OUT_FILE, "| sheets: ROB Level, ROB x Citation Level")
+
