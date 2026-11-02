@@ -1,0 +1,320 @@
+import re
+
+def extract_citations(text):
+    """
+    Pull every citation out of a citation string, in order, no duplicates.
+      '12 CFR 229.13 12 CFR 229.19(e)' -> ['229.13', '229.19(e)']
+      '12 CFR 229.57 Sec. 1086(e)'     -> ['229.57', 'Sec. 1086(e)']
+    cfr = section with a dot (229.19(e)); sec = statutory section written 'Sec.'/'Section'/'§' (Sec. 1086(e))
+    """
+    t = str(text)
+    t = re.sub(r"\b\d+\s*CFR\b", " ", t, flags=re.I)          # drop "12 CFR"
+    t = re.sub(r"\s+(?=\()", "", t)                            # "1086 (e)" -> "1086(e)"
+    pattern = (r"(?P<cfr>\d{3,4}\.\d+[a-z]?(?:\([A-Za-z0-9]+\))*)"
+               r"|(?:Sec(?:tion)?\.?|§)\s*(?P<sec>\d+[a-z]?(?:\([A-Za-z0-9]+\))*)(?![\d.])")
+    out = [m.group("cfr") if m.group("cfr") else f"Sec. {m.group('sec')}"
+           for m in re.finditer(pattern, t, flags=re.I)]
+    return list(dict.fromkeys(out))
+
+
+def related(vendor_cite, regmap_cite):
+    """Same citation branch: 229.19(e)(1) under 229.19(e), or 229.19 above 229.19(e)."""
+    v, r = vendor_cite, regmap_cite
+    return v == r or v.startswith(r + "(") or r.startswith(v + "(")
+
+
+def citation_candidates(cites):
+    """{RegMap citation: [vendor IDs whose citation sits on the same branch]}"""
+    return {c: [vid for vid, vc in VENDOR_CITATION.items() if related(vc, c)] for c in cites}
+
+
+# Vendor lookups (safe to rebuild)
+VENDOR_CITATION  = dict(zip(vd["obligationdetails_obligationuid"], vd["vendor_citation"]))
+VENDOR_SUMMARY   = dict(zip(vd["obligationdetails_obligationuid"], vd["obligationdetails_obligationsummary"]))
+VALID_VENDOR_IDS = set(vd["obligationdetails_obligationuid"])
+
+# Tests
+print(extract_citations("12 CFR 229.13 12 CFR 229.19(e)"))   # ['229.13', '229.19(e)']
+print(extract_citations("12 CFR 229.57 Sec. 1086(e)"))       # ['229.57', 'Sec. 1086(e)']
+
+# Rebuild RegMap citation lists with the fixed parser
+rm["citation_list"] = rm["Obligation Citation"].apply(extract_citations)
+
+# Raw vs parsed side by side - confirm nothing is dropped
+pd.set_option("display.max_colwidth", None)
+print(rm[["Obligation ID", "Obligation Citation", "citation_list"]].to_string(), "\n")
+
+# RegMap citations that NO vendor obligation cites (expected misses)
+for _, o in rm.iterrows():
+    for c, ids in citation_candidates(o["citation_list"]).items():
+        if not ids:
+            print(f"No vendor citation: {o['Obligation ID']} -> {c}")
+
+
+
+REG_NAME = "Regulation CC (Availability of Funds and Collection of Checks, 12 CFR 229)"
+
+
+def build_prompt(o):
+    """o = one RegMap row. Returns the prompt. {{ }} become { } in the f-string."""
+    cites = o["citation_list"]
+    cands = citation_candidates(cites)
+
+    # Each RegMap citation with the vendor rows on the same citation branch (hints only)
+    cite_lines = "\n".join(
+        f"  - {c}: vendor rows citing this provision -> "
+        + (", ".join(f"{v} ({VENDOR_CITATION[v]})" for v in cands[c]) or "NONE")
+        for c in cites
+    ) or "  - (no citation provided)"
+
+    return f"""You are a senior US regulatory compliance analyst reviewing {REG_NAME}.
+Your output will be read by senior compliance and risk stakeholders.
+
+TASK
+Assess whether ONE HSBC RegMap obligation is covered by the vendor-identified obligations below,
+both OVERALL and for EACH RegMap citation separately.
+
+THE REGMAP OBLIGATION CITES THESE PROVISIONS
+{cite_lines}
+The vendor rows listed next to each citation are those whose citation falls under that provision.
+Confirm or reject each on CONTENT. If a citation shows NONE, no vendor obligation cites that
+provision; report it as NOT COVERED and note any related vendor content in the evidence.
+
+WHICH VENDOR OBLIGATIONS COUNT AS "COVERING" (be strict)
+Include a vendor obligation ONLY if it states a requirement that forms part of THIS RegMap obligation.
+Vendors often split one rule across several rows - include every such row - but EXCLUDE:
+  - general, definitional or framework rules that merely apply to many obligations,
+    unless the RegMap text itself contains that requirement;
+  - rows whose scope differs from the RegMap obligation;
+  - rows that are only thematically related.
+
+PER-CITATION COVERAGE
+For EVERY RegMap citation listed above, return one entry:
+  "regmap_citation": exactly as listed above
+  "status": "COVERED" | "PARTIALLY COVERED" | "NOT COVERED"
+  "covering_vendor_ids": vendor IDs covering the requirement this citation contributes
+  "evidence": one sentence with quoted wording, e.g.
+     RegMap ({{citation}}) requires "..."; vendor <id> ({{vendor citation}}) states "..." / no vendor obligation addresses it.
+
+OVERALL COVERAGE STATUS
+  FULL    = every citation COVERED and no material element missing
+  PARTIAL = some coverage, but at least one citation or material element not fully covered
+  NONE    = no vendor obligation addresses the core requirement
+
+GAPS / DIFFERENCES
+Return a list of points. Check: obligated party, required/prohibited action, scope,
+conditions/triggers, timing, numeric thresholds, exceptions, other material details.
+Each point has:
+  "type": "Covered" | "Structural" | "Missing in Vendor" | "Missing in RegMap"
+     Covered           - one point summarising what the vendor obligations cover
+     Structural        - e.g. one RegMap obligation distributed across several vendor rows
+     Missing in Vendor - a RegMap requirement absent from / different in the vendor obligations
+                         (one point for EACH citation that is NOT COVERED or PARTIALLY COVERED)
+     Missing in RegMap - a material vendor requirement absent from the RegMap text
+  "point":    one professional sentence
+  "evidence": supporting wording in double quotes, naming source and citation
+Rules:
+- Start with one "Covered" point (or, if status is NONE, a "Missing in Vendor" point).
+- Every Missing point MUST have quoted evidence.
+- NEVER give recommendations, next steps or suggestions. NEVER mention scores or ratings.
+
+IF OVERALL STATUS IS NONE
+Fill "nearest_thematic" with one sentence naming the closest related vendor rules with citations.
+
+STRICT RULES
+- Only use vendor obligation IDs from the list. Never invent IDs.
+
+REGMAP OBLIGATION
+ID: {o['Obligation ID']}
+Citations: {", ".join(cites) if cites else o['Obligation Citation']}
+Title: {o['Obligation Title']}
+Text: {o['Obligation Detailed Text']}
+
+VENDOR OBLIGATIONS
+{vendor_block}
+
+Return ONLY valid JSON (no markdown) in exactly this shape:
+{{
+  "citation_coverage": [
+    {{"regmap_citation": "229.13", "status": "COVERED", "covering_vendor_ids": ["ecfr...."], "evidence": "..."}},
+    {{"regmap_citation": "229.57", "status": "NOT COVERED", "covering_vendor_ids": [], "evidence": "..."}}
+  ],
+  "covering_vendor_ids": ["ecfr....", "ecfr...."],
+  "coverage_status": "FULL|PARTIAL|NONE",
+  "gaps": [
+    {{"type": "Covered", "point": "...", "evidence": "..."}},
+    {{"type": "Missing in Vendor", "point": "Citation 229.57 is not covered: ...", "evidence": "RegMap (229.57) requires \\"...\\"; no vendor obligation addresses it."}}
+  ],
+  "nearest_thematic": ""
+}}"""
+
+# Preview the citation section of the prompt for the ROB with the most citations
+o_test = rm.loc[rm["citation_list"].str.len().idxmax()]
+p = build_prompt(o_test)
+print(p[p.find("THE REGMAP OBLIGATION CITES"):p.find("WHICH VENDOR")])
+
+
+CITE_LABEL = {"COVERED": "Covered", "PARTIALLY COVERED": "Partially covered", "NOT COVERED": "Not covered"}
+
+
+def format_coverage_text(ids, nearest=""):
+    """'• <vendor id> - <exact vendor text>' per covering vendor obligation."""
+    if not ids:
+        return nearest or "No related vendor obligation identified."
+    return "\n".join(f"• {i} - {VENDOR_SUMMARY.get(i, '')}" for i in ids)
+
+
+def format_citation_coverage(cov):
+    """'• 229.57 - Not covered. Evidence: ...' per RegMap citation (used in the test print)."""
+    if not cov:
+        return "No citation provided in RegMap."
+    lines = []
+    for c in cov:
+        line = f"• {c['regmap_citation']} - {CITE_LABEL.get(c['status'], c['status'])}"
+        if c["covering_vendor_ids"]:
+            line += " by " + ", ".join(f"{i} ({VENDOR_CITATION.get(i, '')})" for i in c["covering_vendor_ids"])
+        line += "."
+        if c.get("evidence"):
+            line += f" Evidence: {c['evidence'].strip()}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def format_gaps(gaps):
+    """'• <Type>: <point> Evidence: <quoted evidence>' per gap."""
+    out = []
+    for g in gaps:
+        line = f"• {g['type']}: {g['point'].strip()}"
+        if g.get("evidence"):
+            line += f" Evidence: {g['evidence'].strip()}"
+        out.append(line)
+    return "\n".join(out)
+
+print("Helpers ready")
+
+
+STRICT_CITATION = True    # citation is "Covered" only if some vendor obligation cites it (same branch)
+
+ALLOWED_GAP_TYPES = ["Covered", "Structural", "Missing in Vendor", "Missing in RegMap"]   # display order
+CITE_STATUSES     = ["COVERED", "PARTIALLY COVERED", "NOT COVERED"]
+by_cite = lambda i: VENDOR_CITATION.get(i, "")
+
+
+def parse_json(txt):
+    """Strip ``` fences if present, then convert text -> dict."""
+    txt = re.sub(r"^```(json)?", "", str(txt).strip())
+    txt = re.sub(r"```$", "", txt)
+    return json.loads(txt.strip())
+
+
+def clean_ids(ids):
+    """Real vendor IDs only, no duplicates, ordered by vendor citation."""
+    return sorted([i for i in dict.fromkeys(ids or []) if i in VALID_VENDOR_IDS], key=by_cite)
+
+
+def validate(out, cites):
+    """Make the LLM answer consistent with the RegMap citations and the citation rule."""
+    cands = citation_candidates(cites)
+
+    # --- 1. One entry per RegMap citation, in RegMap order ---
+    given = {}
+    for c in out.get("citation_coverage", []):
+        raw = str(c.get("regmap_citation", "")).strip()
+        key = (extract_citations(raw) or [raw])[0]                  # normalise "12 CFR 229.13" -> "229.13"
+        if key in cites and key not in given:
+            status = str(c.get("status", "")).strip().upper()
+            given[key] = {"regmap_citation": key,
+                          "status": status if status in CITE_STATUSES else "PARTIALLY COVERED",
+                          "covering_vendor_ids": clean_ids(c.get("covering_vendor_ids")),
+                          "evidence": str(c.get("evidence", "")).strip()}
+
+    coverage, citation_gaps = [], []
+    for c in cites:
+        e = given.get(c, {"regmap_citation": c, "status": "NOT COVERED", "covering_vendor_ids": [],
+                          "evidence": "This citation was not assessed in the automated comparison; manual review required."})
+
+        # "Covered" with no vendor IDs is not credible
+        if e["status"] != "NOT COVERED" and not e["covering_vendor_ids"]:
+            e["status"] = "NOT COVERED"
+
+        # Citation rule: no vendor obligation cites this provision -> Not covered
+        if STRICT_CITATION and not cands[c]:
+            if e["covering_vendor_ids"]:
+                related_ids = ", ".join(f"{i} ({VENDOR_CITATION[i]})" for i in e["covering_vendor_ids"])
+                e["evidence"] = (f"No vendor obligation cites {c}. Related content appears in vendor obligations "
+                                 f"under other citations ({related_ids}), but the provision itself is not identified "
+                                 f"by the vendor. {e['evidence']}").strip()
+            elif not e["evidence"].startswith("No vendor obligation cites"):
+                e["evidence"] = f"No vendor obligation cites {c}. {e['evidence']}".strip()
+            e["status"] = "NOT COVERED"
+            e["covering_vendor_ids"] = []
+
+        # Every uncovered citation must appear as a gap bullet
+        if e["status"] != "COVERED":
+            citation_gaps.append({"citation": c, "type": "Missing in Vendor",
+                                  "point": f"Citation {c} is {CITE_LABEL[e['status']].lower()} by the vendor obligations.",
+                                  "evidence": e["evidence"]})
+        coverage.append(e)
+    out["citation_coverage"] = coverage
+
+    # --- 2. Overall vendor IDs = top-level + per-citation ---
+    all_ids = list(out.get("covering_vendor_ids", [])) + [i for e in coverage for i in e["covering_vendor_ids"]]
+    out["covering_vendor_ids"] = clean_ids(all_ids)
+
+    # --- 3. Overall status ---
+    status = str(out.get("coverage_status", "")).strip().upper()
+    if not out["covering_vendor_ids"]:
+        status = "NONE"
+    elif any(e["status"] != "COVERED" for e in coverage):
+        status = "PARTIAL"                                          # cannot be FULL with an uncovered citation
+    elif status not in ("FULL", "PARTIAL"):
+        status = "PARTIAL"
+    out["coverage_status"] = status
+
+    # --- 4. Gaps: model's gaps + any uncovered citation it didn't already mention ---
+    gaps = [g for g in out.get("gaps", [])
+            if isinstance(g, dict) and g.get("type") in ALLOWED_GAP_TYPES and g.get("point")]
+    mentioned = " ".join(str(g.get("point", "")) + " " + str(g.get("evidence", "")) for g in gaps)
+    for g in citation_gaps:
+        if g["citation"] not in mentioned:
+            gaps.append({k: g[k] for k in ("type", "point", "evidence")})
+    out["gaps"] = sorted(gaps, key=lambda g: ALLOWED_GAP_TYPES.index(g["type"]))
+    return out
+
+
+def compare_one(o, retries=3):
+    """Assess vendor coverage for one RegMap obligation."""
+    prompt = build_prompt(o)
+
+    for attempt in range(retries):
+        raw = ai_chat(prompt)                                       # your existing API function
+
+        if str(raw).startswith("API Error"):                        # gateway error -> wait and retry
+            print("   API error:", str(raw)[:150])
+            time.sleep(3 * (attempt + 1))
+            continue
+
+        try:
+            return validate(parse_json(raw), o["citation_list"])
+        except Exception as e:
+            print("   Bad JSON, retrying:", e)
+
+    # All retries failed -> placeholder so the loop continues
+    return {"covering_vendor_ids": [], "coverage_status": "ERROR", "nearest_thematic": "",
+            "citation_coverage": [{"regmap_citation": c, "status": "NOT COVERED", "covering_vendor_ids": [],
+                                   "evidence": "Automated assessment could not be completed; manual review required."}
+                                  for c in o["citation_list"]],
+            "gaps": [{"type": "Missing in Vendor",
+                      "point": "Automated assessment could not be completed; manual review required.", "evidence": ""}]}
+
+print("Ready. STRICT_CITATION =", STRICT_CITATION)
+
+
+res = compare_one(o_test)     # o_test = ROB with the most citations (from Step B)
+
+print("REGMAP:", o_test["Obligation ID"], "| Citations:", o_test["citation_list"], "| Status:", res["coverage_status"])
+print("\nCitation Coverage:\n" + format_citation_coverage(res["citation_coverage"]))
+print("\nCovering Vendor Obligation ID(s):\n ", ", ".join(res["covering_vendor_ids"]) or "No direct vendor obligation")
+print("\nGaps / Differences:\n" + format_gaps(res["gaps"]))
+
+
