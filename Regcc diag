@@ -126,3 +126,26 @@ def validate(out, cites):
 print("validate() updated")
 
 
+
+from tqdm.auto import tqdm
+
+results_rev = {}   # fresh run with the new validate()
+
+pbar = tqdm(rm.iterrows(), total=len(rm), desc="RegMap -> Vendor")
+for _, o in pbar:
+    pbar.set_postfix({"current": o["Obligation ID"]})
+    results_rev[o["Obligation ID"]] = compare_one(o)
+
+# For each ROB: what the model returned vs the final per-citation result
+for oid, r in results_rev.items():
+    print(f"\n{oid}")
+    print("  model returned:", [(str(c.get('regmap_citation') or c.get('citation')), str(c.get('status')))
+                                for c in r.get("_raw_citation_coverage", [])])
+    for c in r["citation_coverage"]:
+        n = len(citation_candidates([c["regmap_citation"]])[c["regmap_citation"]])
+        print(f"  final: {c['regmap_citation']:<14} {c['status']:<18} vendor rows citing it: {n}")
+
+
+
+
+
