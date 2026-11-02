@@ -13,46 +13,70 @@ print("Top-level covering IDs:", r["covering_vendor_ids"])
 for c in r["citation_coverage"]:
     print(c["regmap_citation"], "|", c["status"], "|", c["covering_vendor_ids"], "\n   ", c["evidence"][:300])
 
+def match_regmap_citation(entry, cites, taken):
+    """
+    Map one model entry to a RegMap citation:
+      1) exact match, 2) same branch (229.14(a) -> 229.14), 3) citation mentioned in the entry text.
+    'taken' = citations already matched, so each RegMap citation gets one entry.
+    """
+    raw = str(entry.get("regmap_citation") or entry.get("citation") or entry.get("regmap_cite") or "").strip()
+    parsed = extract_citations(raw) or ([raw] if raw else [])
+    free = [c for c in cites if c not in taken]
+
+    for p in parsed:                               # 1) exact
+        if p in free:
+            return p
+    for p in parsed:                               # 2) same branch
+        for c in free:
+            if related(p, c):
+                return c
+    blob = json.dumps(entry)                       # 3) mentioned anywhere in the entry
+    for c in free:
+        if c in blob:
+            return c
+    return None
+
+
 def validate(out, cites):
     """Make the LLM answer consistent with the RegMap citations and the citation rule."""
-    cands = citation_candidates(cites)
+    cands = citation_candidates(cites)                                              # vendor rows citing each provision
     out["_raw_citation_coverage"] = json.loads(json.dumps(out.get("citation_coverage", [])))  # audit copy
+    top_ids = clean_ids(out.get("covering_vendor_ids", []))                         # model's overall vendor picks
 
-    top_ids = clean_ids(out.get("covering_vendor_ids", []))      # model's overall vendor list
-
-    # --- 1. One entry per RegMap citation, in RegMap order ---
+    # --- 1. Match each model entry to a RegMap citation ---
     given = {}
-    for c in out.get("citation_coverage", []):
-        raw = str(c.get("regmap_citation", "")).strip()
-        key = (extract_citations(raw) or [raw])[0]
-        if key in cites and key not in given:
-            status = str(c.get("status", "")).strip().upper()
-            given[key] = {"regmap_citation": key,
-                          "status": status if status in CITE_STATUSES else "PARTIALLY COVERED",
-                          "covering_vendor_ids": clean_ids(c.get("covering_vendor_ids")),
-                          "evidence": str(c.get("evidence", "")).strip()}
+    for entry in out.get("citation_coverage", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        key = match_regmap_citation(entry, cites, taken=given.keys())
+        if key is None:
+            continue
+        status = str(entry.get("status", "")).strip().upper()
+        given[key] = {"regmap_citation": key,
+                      "status": status if status in CITE_STATUSES else "PARTIALLY COVERED",
+                      "covering_vendor_ids": clean_ids(entry.get("covering_vendor_ids")),
+                      "evidence": str(entry.get("evidence", "")).strip()}
 
     coverage, citation_gaps = [], []
     for c in cites:
         e = given.get(c, {"regmap_citation": c, "status": "NOT COVERED", "covering_vendor_ids": [],
                           "evidence": "This citation was not assessed in the automated comparison; manual review required."})
+        top_on_branch = [i for i in top_ids if i in cands[c]]   # overall picks that cite this provision
 
-        # Vendor rows the model chose overall that also cite this provision
-        top_on_branch = [i for i in top_ids if i in cands[c]]
-
-        # (a) Model says covered but gave no per-citation IDs -> backfill from its overall list on this branch
+        # (a) Covered but no per-citation IDs -> backfill from overall picks on this branch
         if e["status"] != "NOT COVERED" and not e["covering_vendor_ids"]:
             e["covering_vendor_ids"] = top_on_branch
 
-        # (b) Model says NOT COVERED but its own overall list includes rows citing this provision -> partial
+        # (b) Not covered / not assessed, but overall picks cite this provision -> partially covered
         if e["status"] == "NOT COVERED" and top_on_branch:
             e["status"] = "PARTIALLY COVERED"
             e["covering_vendor_ids"] = top_on_branch
             ids_txt = ", ".join(f"{i} ({VENDOR_CITATION[i]})" for i in top_on_branch)
+            prior = "" if e["evidence"].startswith("This citation was not assessed") else e["evidence"]
             e["evidence"] = (f"Vendor obligations citing this provision were identified ({ids_txt}); "
-                             f"content coverage requires confirmation. {e['evidence']}").strip()
+                             f"content coverage requires confirmation. {prior}").strip()
 
-        # (c) Still covered with no IDs at all -> not credible
+        # (c) Covered with no vendor IDs at all -> not credible
         if e["status"] != "NOT COVERED" and not e["covering_vendor_ids"]:
             e["status"] = "NOT COVERED"
 
@@ -68,6 +92,7 @@ def validate(out, cites):
             e["status"] = "NOT COVERED"
             e["covering_vendor_ids"] = []
 
+        # Every uncovered citation becomes a gap bullet
         if e["status"] != "COVERED":
             citation_gaps.append({"citation": c, "type": "Missing in Vendor",
                                   "point": f"Citation {c} is {CITE_LABEL[e['status']].lower()} by the vendor obligations.",
@@ -83,12 +108,12 @@ def validate(out, cites):
     if not out["covering_vendor_ids"]:
         status = "NONE"
     elif any(e["status"] != "COVERED" for e in coverage):
-        status = "PARTIAL"
+        status = "PARTIAL"                                  # cannot be FULL with an uncovered citation
     elif status not in ("FULL", "PARTIAL"):
         status = "PARTIAL"
     out["coverage_status"] = status
 
-    # --- 4. Gaps ---
+    # --- 4. Gaps: model's gaps + uncovered citations it didn't mention ---
     gaps = [g for g in out.get("gaps", [])
             if isinstance(g, dict) and g.get("type") in ALLOWED_GAP_TYPES and g.get("point")]
     mentioned = " ".join(str(g.get("point", "")) + " " + str(g.get("evidence", "")) for g in gaps)
