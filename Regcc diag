@@ -1,0 +1,103 @@
+# 1) Are the 229.14 rows in vd, and what citation did they get?
+print("Vendor rows whose citation starts with 229.14:")
+print(vd.loc[vd["vendor_citation"].astype(str).str.startswith("229.14"),
+             ["obligationdetails_obligationuid", "section_number",
+              "obligationdetails_rules_rule_clause", "vendor_citation"]].to_string(), "\n")
+
+# 2) Does the citation matching find them?
+print("Candidates for 229.14:", citation_candidates(["229.14"]), "\n")
+
+# 3) What did the LLM + validation produce for that ROB?
+r = results_rev["ROB-00025182"]
+print("Top-level covering IDs:", r["covering_vendor_ids"])
+for c in r["citation_coverage"]:
+    print(c["regmap_citation"], "|", c["status"], "|", c["covering_vendor_ids"], "\n   ", c["evidence"][:300])
+
+def validate(out, cites):
+    """Make the LLM answer consistent with the RegMap citations and the citation rule."""
+    cands = citation_candidates(cites)
+    out["_raw_citation_coverage"] = json.loads(json.dumps(out.get("citation_coverage", [])))  # audit copy
+
+    top_ids = clean_ids(out.get("covering_vendor_ids", []))      # model's overall vendor list
+
+    # --- 1. One entry per RegMap citation, in RegMap order ---
+    given = {}
+    for c in out.get("citation_coverage", []):
+        raw = str(c.get("regmap_citation", "")).strip()
+        key = (extract_citations(raw) or [raw])[0]
+        if key in cites and key not in given:
+            status = str(c.get("status", "")).strip().upper()
+            given[key] = {"regmap_citation": key,
+                          "status": status if status in CITE_STATUSES else "PARTIALLY COVERED",
+                          "covering_vendor_ids": clean_ids(c.get("covering_vendor_ids")),
+                          "evidence": str(c.get("evidence", "")).strip()}
+
+    coverage, citation_gaps = [], []
+    for c in cites:
+        e = given.get(c, {"regmap_citation": c, "status": "NOT COVERED", "covering_vendor_ids": [],
+                          "evidence": "This citation was not assessed in the automated comparison; manual review required."})
+
+        # Vendor rows the model chose overall that also cite this provision
+        top_on_branch = [i for i in top_ids if i in cands[c]]
+
+        # (a) Model says covered but gave no per-citation IDs -> backfill from its overall list on this branch
+        if e["status"] != "NOT COVERED" and not e["covering_vendor_ids"]:
+            e["covering_vendor_ids"] = top_on_branch
+
+        # (b) Model says NOT COVERED but its own overall list includes rows citing this provision -> partial
+        if e["status"] == "NOT COVERED" and top_on_branch:
+            e["status"] = "PARTIALLY COVERED"
+            e["covering_vendor_ids"] = top_on_branch
+            ids_txt = ", ".join(f"{i} ({VENDOR_CITATION[i]})" for i in top_on_branch)
+            e["evidence"] = (f"Vendor obligations citing this provision were identified ({ids_txt}); "
+                             f"content coverage requires confirmation. {e['evidence']}").strip()
+
+        # (c) Still covered with no IDs at all -> not credible
+        if e["status"] != "NOT COVERED" and not e["covering_vendor_ids"]:
+            e["status"] = "NOT COVERED"
+
+        # (d) Citation rule: no vendor obligation cites this provision -> Not covered
+        if STRICT_CITATION and not cands[c]:
+            if e["covering_vendor_ids"]:
+                related_ids = ", ".join(f"{i} ({VENDOR_CITATION[i]})" for i in e["covering_vendor_ids"])
+                e["evidence"] = (f"No vendor obligation cites {c}. Related content appears in vendor obligations "
+                                 f"under other citations ({related_ids}), but the provision itself is not identified "
+                                 f"by the vendor. {e['evidence']}").strip()
+            elif not e["evidence"].startswith("No vendor obligation cites"):
+                e["evidence"] = f"No vendor obligation cites {c}. {e['evidence']}".strip()
+            e["status"] = "NOT COVERED"
+            e["covering_vendor_ids"] = []
+
+        if e["status"] != "COVERED":
+            citation_gaps.append({"citation": c, "type": "Missing in Vendor",
+                                  "point": f"Citation {c} is {CITE_LABEL[e['status']].lower()} by the vendor obligations.",
+                                  "evidence": e["evidence"]})
+        coverage.append(e)
+    out["citation_coverage"] = coverage
+
+    # --- 2. Overall vendor IDs ---
+    out["covering_vendor_ids"] = clean_ids(top_ids + [i for e in coverage for i in e["covering_vendor_ids"]])
+
+    # --- 3. Overall status ---
+    status = str(out.get("coverage_status", "")).strip().upper()
+    if not out["covering_vendor_ids"]:
+        status = "NONE"
+    elif any(e["status"] != "COVERED" for e in coverage):
+        status = "PARTIAL"
+    elif status not in ("FULL", "PARTIAL"):
+        status = "PARTIAL"
+    out["coverage_status"] = status
+
+    # --- 4. Gaps ---
+    gaps = [g for g in out.get("gaps", [])
+            if isinstance(g, dict) and g.get("type") in ALLOWED_GAP_TYPES and g.get("point")]
+    mentioned = " ".join(str(g.get("point", "")) + " " + str(g.get("evidence", "")) for g in gaps)
+    for g in citation_gaps:
+        if g["citation"] not in mentioned:
+            gaps.append({k: g[k] for k in ("type", "point", "evidence")})
+    out["gaps"] = sorted(gaps, key=lambda g: ALLOWED_GAP_TYPES.index(g["type"]))
+    return out
+
+print("validate() updated")
+
+
