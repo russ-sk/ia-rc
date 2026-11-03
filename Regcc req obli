@@ -1,0 +1,233 @@
+import pandas as pd, json, re, time
+from tqdm.auto import tqdm
+
+# Work on a copy; drop the duplicated 'rules_source' column name if present
+vq = vendor_obli_detail3.loc[:, ~vendor_obli_detail3.columns.duplicated()].copy()
+
+# Clean both texts: collapse whitespace and line breaks
+for col in ["obligationdetails_obligationsummary", "obligationdetails_rules_requirement"]:
+    vq[col] = (vq[col].fillna("").astype(str)
+                      .str.replace(r"\s+", " ", regex=True)
+                      .str.strip())
+
+# Citation for context, e.g. "Section § 229.10 - ..." + "(a)(1)" -> "229.10(a)(1)"
+section = vq["obligationdetails_rules_ruleheader8"].astype(str).str.extract(r"(\d{3,4}\.\d+[a-z]?)")[0].fillna("")
+vq["citation"] = section + vq["obligationdetails_rules_rule_clause"].fillna("").astype(str).str.strip()
+
+print("Rows:", len(vq))
+print("Rows with empty summary:", (vq["obligationdetails_obligationsummary"] == "").sum(),
+      "| empty requirement:", (vq["obligationdetails_rules_requirement"] == "").sum())
+vq[["obligationdetails_obligationuid", "citation"]].head()
+
+
+# ---- Material-difference rubric (internal; points never shown to stakeholders) ----
+SQ_RUBRIC = {
+    "ACTION_DIFFERENT":     40,  # required/prohibited action is different or reversed (e.g. "may" vs "must")
+    "ACTOR_DIFFERENT":      20,  # obligated party differs (bank vs depositary bank vs paying bank)
+    "SCOPE_DIFFERENT":      15,  # accounts, deposits or products covered differ / narrower / broader
+    "CONDITION_MISSING":    15,  # a trigger or condition is missing or changed ("if made in person to an employee")
+    "TIMING_DIFFERENT":     15,  # a deadline or timing differs ("next business day" vs "second business day")
+    "THRESHOLD_DIFFERENT":  15,  # a numeric amount or limit is missing or different ("$225", "$5,525")
+    "EXCEPTION_MISSING":    10,  # an exception or exemption in the requirement is missing
+    "ELEMENT_MISSING":      10,  # another material element of the requirement is omitted
+    "ELEMENT_ADDED":        10,  # summary adds a material requirement not in the rule text
+    "MEANING_DISTORTED":    25,  # summary misstates the rule in a way that changes its effect
+}
+SQ_MEANING = {
+    "ACTION_DIFFERENT":    "the required or prohibited action differs or is reversed",
+    "ACTOR_DIFFERENT":     "the obligated party differs",
+    "SCOPE_DIFFERENT":     "the accounts, deposits or products covered differ",
+    "CONDITION_MISSING":   "a trigger or condition is missing or changed",
+    "TIMING_DIFFERENT":    "a deadline or timing requirement differs or is missing",
+    "THRESHOLD_DIFFERENT": "a numeric amount or limit is missing or different",
+    "EXCEPTION_MISSING":   "an exception or exemption is missing",
+    "ELEMENT_MISSING":     "another material element of the requirement is omitted",
+    "ELEMENT_ADDED":       "the summary adds a material requirement not in the rule text",
+    "MEANING_DISTORTED":   "the summary misstates the rule in a way that changes its effect",
+}
+sq_rubric_text = "\n".join(f"  {k}: {v}" for k, v in SQ_MEANING.items())
+
+
+def build_sq_prompt(row):
+    """row = one vendor row. Compares the vendor's obligation summary with the rule requirement text."""
+    return f"""You are a senior US regulatory compliance stakeholder reviewing a vendor's obligation library
+for Regulation CC (Availability of Funds and Collection of Checks, 12 CFR 229).
+
+TASK
+Assess whether the vendor's OBLIGATION SUMMARY faithfully represents the RULE REQUIREMENT text it was derived from.
+
+HOW TO JUDGE
+- Judge MEANING, not wording. Paraphrasing, reordering, plain-English rewording, or omitting purely
+  non-substantive words is NOT a difference.
+- If the two texts essentially mean the same thing for compliance purposes, record NO differences.
+- Break the RULE REQUIREMENT into its material elements: obligated party, required/prohibited action,
+  scope (accounts, deposits, items), conditions/triggers, timing, numeric thresholds, exceptions.
+- Record a difference ONLY if it is MATERIAL - i.e. a compliance officer relying on the summary alone
+  would apply the rule differently from the rule text.
+- Record each distinct material difference once, using one of these codes:
+{sq_rubric_text}
+- Each difference must include short quoted evidence from BOTH texts (or state that one text is silent).
+
+REASONING (stakeholder-facing)
+Write 2-4 sentences in formal, precise professional English:
+- State whether the summary is equivalent to the rule requirement.
+- If not, describe each material difference with quoted wording from both texts.
+- NEVER mention points, scores, codes or percentages. NEVER give recommendations.
+
+CITATION: {row['citation']}
+
+RULE REQUIREMENT
+{row['obligationdetails_rules_requirement']}
+
+VENDOR OBLIGATION SUMMARY
+{row['obligationdetails_obligationsummary']}
+
+Return ONLY valid JSON (no markdown) in exactly this shape:
+{{
+  "differences": [
+    {{"code": "TIMING_DIFFERENT", "evidence": "Rule: 'not later than the second business day'; Summary: 'next business day'"}}
+  ],
+  "reasoning": "..."
+}}"""
+
+print(build_sq_prompt(vq.iloc[0])[:2500])   # preview
+
+
+
+def sq_band(score):
+    """Exact only when meaning is the same (100); Partial 40-99; No Match below 40."""
+    if score >= 100: return "Exact"
+    if score >= 40:  return "Partial"
+    return "No Match"
+
+
+def sq_parse_json(txt):
+    """Strip ``` fences if present, then convert text -> dict."""
+    txt = re.sub(r"^```(json)?", "", str(txt).strip())
+    txt = re.sub(r"```$", "", txt)
+    return json.loads(txt.strip())
+
+
+def compare_summary_requirement(row, retries=3):
+    """Compare one vendor row's summary vs rule requirement."""
+    summ = row["obligationdetails_obligationsummary"]
+    req  = row["obligationdetails_rules_requirement"]
+
+    # Missing text -> no LLM call needed
+    if not summ or not req:
+        return {"differences": [], "score": 0, "match_type": "No Match",
+                "reasoning": "Comparison not possible: the " +
+                             ("obligation summary" if not summ else "rule requirement") + " is blank."}
+
+    prompt = build_sq_prompt(row)
+    for attempt in range(retries):
+        raw = ai_chat(prompt)                                   # your existing API function
+
+        if str(raw).startswith("API Error"):                    # gateway error -> wait and retry
+            print("   API error:", str(raw)[:150])
+            time.sleep(3 * (attempt + 1))
+            continue
+
+        try:
+            out = sq_parse_json(raw)
+
+            # Keep only known codes; one deduction per code
+            diffs, seen = [], set()
+            for d in out.get("differences", []) or []:
+                code = str(d.get("code", "")).strip().upper()
+                if code in SQ_RUBRIC and code not in seen:
+                    seen.add(code)
+                    diffs.append({"code": code, "points": SQ_RUBRIC[code],
+                                  "evidence": str(d.get("evidence", "")).strip()})
+
+            score = max(0, 100 - sum(d["points"] for d in diffs))   # no differences -> 100
+            return {"differences": diffs, "score": score, "match_type": sq_band(score),
+                    "reasoning": str(out.get("reasoning", "")).strip()}
+
+        except Exception as e:
+            print("   Bad JSON, retrying:", e)
+
+    return {"differences": [], "score": None, "match_type": "Error",
+            "reasoning": "Automated comparison could not be completed; manual review required."}
+
+
+for _, row in vq.head(3).iterrows():
+    res = compare_summary_requirement(row)
+    print(row["obligationdetails_obligationuid"], "|", row["citation"])
+    print("Match:", res["match_type"], "| Score:", res["score"])
+    for d in res["differences"]:                                  # internal trail
+        print(f"   -{d['points']} {d['code']}: {d['evidence']}")
+    print("Reasoning:", res["reasoning"])
+    print("-" * 100)
+
+
+sq_results = {}   # comment out after the first full run so re-runs resume
+
+todo = vq[vq["obligationdetails_obligationuid"].map(
+    lambda u: u not in sq_results or sq_results[u]["match_type"] == "Error")]
+print(f"Already done: {len(vq) - len(todo)} | To process now: {len(todo)}")
+
+pbar = tqdm(todo.iterrows(), total=len(todo), desc="Summary vs Requirement")
+errors = 0
+for _, row in pbar:
+    uid = row["obligationdetails_obligationuid"]
+    pbar.set_postfix({"current": uid[-12:], "errors": errors})
+    sq_results[uid] = compare_summary_requirement(row)
+    if sq_results[uid]["match_type"] == "Error":
+        errors += 1
+
+print("Done. Errors:", sum(r["match_type"] == "Error" for r in sq_results.values()))
+
+vq["Match Type"]  = vq["obligationdetails_obligationuid"].map(lambda u: sq_results[u]["match_type"])
+vq["Score (0-100)"] = vq["obligationdetails_obligationuid"].map(lambda u: sq_results[u]["score"])
+vq["Reasoning"]   = vq["obligationdetails_obligationuid"].map(lambda u: sq_results[u]["reasoning"])
+
+# Internal audit trail: why points were lost (drop before sharing if not needed)
+vq["Scoring Audit Trail"] = vq["obligationdetails_obligationuid"].map(
+    lambda u: "\n".join(f"-{d['points']} {d['code']}: {d['evidence']}" for d in sq_results[u]["differences"])
+              or "No material differences")
+
+print(vq["Match Type"].value_counts(), "\n")
+print(vq["Score (0-100)"].describe())
+vq[["obligationdetails_obligationuid", "citation", "Match Type", "Score (0-100)", "Reasoning"]].head(10)
+
+
+from openpyxl.styles import PatternFill, Font, Alignment
+
+SQ_OUT = "RegCC - Vendor Summary vs Requirement.xlsx"
+
+export_cols = ["obligationdetails_obligationuid", "citation", "obligationdetails_topic",
+               "obligationdetails_rules_requirement", "obligationdetails_obligationsummary",
+               "Match Type", "Score (0-100)", "Reasoning", "Scoring Audit Trail"]
+export_df = vq[export_cols].rename(columns={
+    "obligationdetails_obligationuid":     "Vendor Obligation ID",
+    "citation":                            "Citation",
+    "obligationdetails_topic":             "Topic",
+    "obligationdetails_rules_requirement": "Rule Requirement",
+    "obligationdetails_obligationsummary": "Obligation Summary",
+})
+
+fills = {"Exact": PatternFill("solid", fgColor="C6EFCE"),      # green
+         "Partial": PatternFill("solid", fgColor="FFE699"),    # amber
+         "No Match": PatternFill("solid", fgColor="E8462A")}   # red
+
+with pd.ExcelWriter(SQ_OUT, engine="openpyxl") as writer:
+    export_df.to_excel(writer, sheet_name="Summary vs Requirement", index=False)
+    ws = writer.sheets["Summary vs Requirement"]
+
+    for col, w in zip("ABCDEFGHI", [32, 14, 25, 70, 60, 12, 10, 70, 50]):
+        ws.column_dimensions[col].width = w
+
+    wrap = Alignment(wrap_text=True, vertical="top")
+    for cell in ws[1]:
+        cell.fill, cell.font, cell.alignment = PatternFill("solid", fgColor="DDEBF7"), Font(bold=True), wrap
+
+    for row, mt in zip(ws.iter_rows(min_row=2, max_row=ws.max_row), export_df["Match Type"]):
+        for cell in row:
+            cell.alignment = wrap
+            if mt in fills:
+                cell.fill = fills[mt]
+    ws.freeze_panes = "A2"
+
+print("Saved:", SQ_OUT)
+
