@@ -1,0 +1,40 @@
+# 1. Column overview: names, dtypes, null %, cardinality
+pd.set_option('display.max_rows', 100)
+overview = pd.DataFrame({
+    'dtype': record_data.dtypes,
+    'null_pct': (record_data.isna().mean()*100).round(1),
+    'nunique': record_data.nunique()
+})
+overview
+
+# 2. Target: owner fill rate and distribution
+rd = record_data.copy()
+rd['risk_stwrd_ownr'] = rd['risk_stwrd_ownr'].astype(str).str.strip().replace({'': None, 'None': None, 'nan': None})
+print("Owner null:", rd['risk_stwrd_ownr'].isna().sum())
+print("Distinct owners:", rd['risk_stwrd_ownr'].nunique())
+rd['risk_stwrd_ownr'].value_counts().describe()   # long tail?
+rd['risk_stwrd_ownr'].value_counts().head(20)
+
+# 3. Taxonomy and area: are they multi-valued like the steward table?
+for c in [c for c in rd.columns if any(k in c.lower() for k in ['theme','l1','l2','l3','risk_stwrd_area','jris','geo'])]:
+    print(c, rd[c].nunique()); print(rd[c].value_counts().head(10), '\n')
+
+# 4. Coverage: are historical owners in the active steward table?
+rs_ids = set(rs_data['username'].astype(str).str.strip())
+owners = rd['risk_stwrd_ownr'].dropna()
+print("Owner in active steward table:", owners.isin(rs_ids).mean().round(3))
+
+# 5. Owner vs other roles: does the owner often equal delegate/created_by?
+for c in ['created_by','updated_by','delegate','qc_by','record_cat_by']:
+    print(c, (rd[c].astype(str).str.strip() == rd['risk_stwrd_ownr']).mean().round(3))
+
+# 6. Status mix and volume over time
+print(rd['stat_cde'].value_counts())
+rd['created_on_dtm'] = pd.to_datetime(rd['created_on_dtm'])
+rd.set_index('created_on_dtm').resample('M').size()
+
+# 7. Owner concentration within each area (how deterministic is it?)
+rd.groupby('risk_stwrd_area')['risk_stwrd_ownr'].agg(['nunique','count'])
+
+# 8. Text fields available for similarity
+[c for c in rd.columns if rd[c].dtype == object and rd[c].astype(str).str.len().mean() > 50]
